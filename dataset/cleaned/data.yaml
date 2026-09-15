@@ -1,0 +1,14 @@
+path: C:/projects/Sofa_Project_Model_Training/dataset/cleaned
+
+train: train/images
+val: valid/images
+
+nc: 6
+
+names:
+  0: back_cushion
+  1: base
+  2: left_arm
+  3: legs
+  4: right_arm
+  5: seat_cushion
