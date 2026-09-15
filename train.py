@@ -12,7 +12,7 @@ NAME = "sofa_yolo11n_seg_v1"
 
 MAX_EPOCHS = 100
 
-CHECKPOINT = Path(PROJECT) / NAME / "weights" / "last.pt"
+CHECKPOINT = Path("runs/segment/models/sofa_yolo11n_seg_v1-2/weights/last.pt")
 
 
 # ==============================
