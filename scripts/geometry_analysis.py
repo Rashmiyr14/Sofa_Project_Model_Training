@@ -22,13 +22,13 @@ TEXT_OUTPUT = os.path.join(
     "geometry_result.txt"
 )
 
-# YOLO prediction confidence
+# Minimum confidence for YOLO prediction
 PREDICTION_CONFIDENCE = 0.25
 
-# Minimum confidence required for geometry calculations
+# Minimum confidence for geometry calculations
 GEOMETRY_CONFIDENCE = 0.50
 
-# Minimum contour area in pixels
+# Minimum contour area
 MIN_COMPONENT_AREA = 100
 
 
@@ -54,14 +54,26 @@ report_lines = []
 
 
 def log(text=""):
-    """Print and store report text."""
+    """
+    Print text to terminal and store it for the text report.
+    """
+
     print(text)
-    report_lines.append(str(text))
+
+    report_lines.append(
+        str(text)
+    )
 
 
 def save_text_report():
-    """Save the complete analysis report."""
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    """
+    Save complete analysis report.
+    """
+
+    os.makedirs(
+        OUTPUT_DIR,
+        exist_ok=True
+    )
 
     with open(
         TEXT_OUTPUT,
@@ -70,7 +82,10 @@ def save_text_report():
     ) as f:
 
         for line in report_lines:
-            f.write(line + "\n")
+
+            f.write(
+                line + "\n"
+            )
 
 
 # ============================================================
@@ -78,16 +93,25 @@ def save_text_report():
 # ============================================================
 
 def get_class_name(model, class_id):
-    """Safely obtain class name from YOLO model."""
+    """
+    Safely obtain YOLO class name.
+    """
 
     try:
-        return str(model.names[class_id])
+
+        return str(
+            model.names[class_id]
+        )
+
     except Exception:
+
         return f"class_{class_id}"
 
 
 def get_components(components, class_name):
-    """Return all components belonging to a class."""
+    """
+    Return all components belonging to a class.
+    """
 
     return [
         component
@@ -97,7 +121,9 @@ def get_components(components, class_name):
 
 
 def get_largest_component(components, class_name):
-    """Return largest component of requested class."""
+    """
+    Return the largest component of a given class.
+    """
 
     matches = get_components(
         components,
@@ -105,6 +131,7 @@ def get_largest_component(components, class_name):
     )
 
     if not matches:
+
         return None
 
     return max(
@@ -114,41 +141,60 @@ def get_largest_component(components, class_name):
 
 
 def center_distance(component_a, component_b):
-    """Euclidean distance between component centers."""
+    """
+    Calculate Euclidean distance between component centers.
+    """
 
-    if component_a is None or component_b is None:
+    if (
+        component_a is None
+        or
+        component_b is None
+    ):
+
         return None
 
     x1, y1 = component_a["center"]
+
     x2, y2 = component_b["center"]
 
     return float(
         np.sqrt(
-            (x2 - x1) ** 2 +
+            (x2 - x1) ** 2
+            +
             (y2 - y1) ** 2
         )
     )
 
 
 def safe_ratio(a, b):
-    """Safe division."""
+    """
+    Safe division.
+    """
 
     if a is None or b is None:
+
         return None
 
     if b == 0:
+
         return None
 
-    return float(a / b)
+    return float(
+        a / b
+    )
 
 
 def format_value(value):
-    """Format values for the report."""
+    """
+    Format values for the report.
+    """
 
     if value is None:
+
         return "N/A"
 
     if isinstance(value, float):
+
         return f"{value:.4f}"
 
     return str(value)
@@ -156,8 +202,8 @@ def format_value(value):
 
 def get_bbox_edges(component):
     """
-    Return bounding box edges:
-    left, top, right, bottom
+    Return:
+        left, top, right, bottom
     """
 
     x, y, w, h = component["bbox"]
@@ -170,26 +216,115 @@ def get_bbox_edges(component):
     )
 
 
-def bbox_horizontal_gap(component_a, component_b):
+def calculate_horizontal_overlap(
+    component_a,
+    component_b
+):
     """
-    Horizontal gap between two bounding boxes.
-
-    Returns 0 when boxes overlap horizontally.
+    Calculate horizontal overlap between two bounding boxes.
     """
 
-    if component_a is None or component_b is None:
+    if (
+        component_a is None
+        or
+        component_b is None
+    ):
+
         return None
 
-    a_left, _, a_right, _ = get_bbox_edges(component_a)
-    b_left, _, b_right, _ = get_bbox_edges(component_b)
+    a_left, _, a_right, _ = get_bbox_edges(
+        component_a
+    )
 
-    if a_right < b_left:
-        return float(b_left - a_right)
+    b_left, _, b_right, _ = get_bbox_edges(
+        component_b
+    )
 
-    if b_right < a_left:
-        return float(a_left - b_right)
+    overlap_left = max(
+        a_left,
+        b_left
+    )
 
-    return 0.0
+    overlap_right = min(
+        a_right,
+        b_right
+    )
+
+    overlap = max(
+        0,
+        overlap_right - overlap_left
+    )
+
+    return float(
+        overlap
+    )
+
+
+def calculate_usable_seat_span(
+    seat,
+    physical_left_arm,
+    physical_right_arm
+):
+    """
+    Calculate the portion of the seat bounding box
+    that lies between the physical inner edges of
+    the two arms.
+
+    This avoids using seat pixels that extend underneath
+    the arm regions.
+    """
+
+    if (
+        seat is None
+        or
+        physical_left_arm is None
+        or
+        physical_right_arm is None
+    ):
+
+        return None
+
+    seat_left, _, seat_right, _ = get_bbox_edges(
+        seat
+    )
+
+    left_arm_left, _, left_arm_right, _ = get_bbox_edges(
+        physical_left_arm
+    )
+
+    right_arm_left, _, right_arm_right, _ = get_bbox_edges(
+        physical_right_arm
+    )
+
+    # Physical left arm's inner edge
+    inner_left = left_arm_right
+
+    # Physical right arm's inner edge
+    inner_right = right_arm_left
+
+    if inner_right <= inner_left:
+
+        return 0.0
+
+    # Seat portion inside the arm-to-arm region
+    usable_left = max(
+        seat_left,
+        inner_left
+    )
+
+    usable_right = min(
+        seat_right,
+        inner_right
+    )
+
+    usable_span = max(
+        0,
+        usable_right - usable_left
+    )
+
+    return float(
+        usable_span
+    )
 
 
 # ============================================================
@@ -208,16 +343,31 @@ os.makedirs(
 
 try:
 
-    model = YOLO(MODEL_PATH)
+    model = YOLO(
+        MODEL_PATH
+    )
 
-    log("Model loaded successfully.")
-    log(f"Model path: {MODEL_PATH}")
-    log(f"Classes: {model.names}")
+    log(
+        "Model loaded successfully."
+    )
+
+    log(
+        f"Model path: {MODEL_PATH}"
+    )
+
+    log(
+        f"Classes: {model.names}"
+    )
 
 except Exception as e:
 
-    log("ERROR loading model:")
-    log(str(e))
+    log(
+        "ERROR loading model:"
+    )
+
+    log(
+        str(e)
+    )
 
     save_text_report()
 
@@ -235,7 +385,9 @@ image_path = input(
 
 if not image_path:
 
-    log("ERROR: No image path entered.")
+    log(
+        "ERROR: No image path entered."
+    )
 
     save_text_report()
 
@@ -244,27 +396,41 @@ if not image_path:
     )
 
 
-if not os.path.exists(image_path):
+if not os.path.exists(
+    image_path
+):
 
     log("")
-    log("ERROR: Image does not exist.")
-    log(image_path)
+    log(
+        "ERROR: Image does not exist."
+    )
+
+    log(
+        image_path
+    )
 
     save_text_report()
 
-    raise FileNotFoundError(image_path)
+    raise FileNotFoundError(
+        image_path
+    )
 
 
 # ============================================================
 # READ IMAGE
 # ============================================================
 
-image = cv2.imread(image_path)
+image = cv2.imread(
+    image_path
+)
+
 
 if image is None:
 
     log("")
-    log("ERROR: Could not read image.")
+    log(
+        "ERROR: Could not read image."
+    )
 
     save_text_report()
 
@@ -275,14 +441,24 @@ if image is None:
 
 height, width = image.shape[:2]
 
+
 log("")
 log("==============================================")
 log("IMAGE INFORMATION")
 log("==============================================")
 
-log(f"Image path: {image_path}")
-log(f"Image width: {width} px")
-log(f"Image height: {height} px")
+
+log(
+    f"Image path: {image_path}"
+)
+
+log(
+    f"Image width: {width} px"
+)
+
+log(
+    f"Image height: {height} px"
+)
 
 
 # ============================================================
@@ -300,8 +476,13 @@ try:
 except Exception as e:
 
     log("")
-    log("ERROR during YOLO prediction:")
-    log(str(e))
+    log(
+        "ERROR during YOLO prediction:"
+    )
+
+    log(
+        str(e)
+    )
 
     save_text_report()
 
@@ -311,7 +492,9 @@ except Exception as e:
 if not results:
 
     log("")
-    log("ERROR: YOLO returned no results.")
+    log(
+        "ERROR: YOLO returned no results."
+    )
 
     save_text_report()
 
@@ -327,10 +510,16 @@ result = results[0]
 # CHECK DETECTIONS
 # ============================================================
 
-if result.boxes is None or len(result.boxes) == 0:
+if (
+    result.boxes is None
+    or
+    len(result.boxes) == 0
+):
 
     log("")
-    log("No objects detected by YOLO.")
+    log(
+        "No objects detected by YOLO."
+    )
 
     cv2.imwrite(
         IMAGE_OUTPUT,
@@ -347,7 +536,9 @@ if result.boxes is None or len(result.boxes) == 0:
 if result.masks is None:
 
     log("")
-    log("No segmentation masks detected.")
+    log(
+        "No segmentation masks detected."
+    )
 
     cv2.imwrite(
         IMAGE_OUTPUT,
@@ -362,6 +553,7 @@ if result.masks is None:
 
 
 masks = result.masks.data.cpu().numpy()
+
 boxes = result.boxes
 
 
@@ -375,6 +567,7 @@ log("")
 log("==============================================")
 log("YOLO DETECTION SUMMARY")
 log("==============================================")
+
 
 log(
     f"Total detections: {detection_count}"
@@ -401,7 +594,9 @@ log("ALL YOLO PREDICTIONS")
 log("==============================================")
 
 
-for i in range(detection_count):
+for i in range(
+    detection_count
+):
 
     class_id = int(
         boxes.cls[i].item()
@@ -428,12 +623,18 @@ for i in range(detection_count):
 # ============================================================
 
 class_colors = {
-    0: (255, 0, 0),       # back_cushion
-    1: (0, 255, 0),       # base
-    2: (255, 0, 255),     # left_arm
-    3: (0, 255, 255),     # legs
-    4: (0, 0, 255),       # right_arm
-    5: (255, 255, 0),     # seat_cushion
+
+    0: (255, 0, 0),        # back_cushion
+
+    1: (0, 255, 0),        # base
+
+    2: (255, 0, 255),      # left_arm
+
+    3: (0, 255, 255),      # legs
+
+    4: (0, 0, 255),        # right_arm
+
+    5: (255, 255, 0),      # seat_cushion
 }
 
 
@@ -449,10 +650,14 @@ log("==============================================")
 
 components = []
 
+
+# Start visualization from original image.
 visualization = image.copy()
 
 
-for i in range(detection_count):
+for i in range(
+    detection_count
+):
 
     class_id = int(
         boxes.cls[i].item()
@@ -467,15 +672,18 @@ for i in range(detection_count):
         class_id
     )
 
+
     # --------------------------------------------------------
-    # Prediction display threshold
+    # Prediction threshold
     # --------------------------------------------------------
 
     if confidence < PREDICTION_CONFIDENCE:
+
         continue
 
+
     # --------------------------------------------------------
-    # Resize segmentation mask
+    # Resize mask
     # --------------------------------------------------------
 
     mask_resized = cv2.resize(
@@ -484,9 +692,13 @@ for i in range(detection_count):
         interpolation=cv2.INTER_NEAREST
     )
 
+
     binary_mask = (
         mask_resized > 0.5
-    ).astype(np.uint8) * 255
+    ).astype(
+        np.uint8
+    ) * 255
+
 
     # --------------------------------------------------------
     # Find contours
@@ -498,21 +710,28 @@ for i in range(detection_count):
         cv2.CHAIN_APPROX_SIMPLE
     )
 
+
     if not contours:
+
         continue
 
-    # Use largest contour for this YOLO instance
+
+    # Largest contour
     contour = max(
         contours,
         key=cv2.contourArea
     )
 
+
     area = cv2.contourArea(
         contour
     )
 
+
     if area < MIN_COMPONENT_AREA:
+
         continue
+
 
     # --------------------------------------------------------
     # Bounding box
@@ -522,10 +741,12 @@ for i in range(detection_count):
         contour
     )
 
+
     aspect_ratio = safe_ratio(
         w,
         h
     )
+
 
     # --------------------------------------------------------
     # Perimeter
@@ -536,6 +757,7 @@ for i in range(detection_count):
         True
     )
 
+
     # --------------------------------------------------------
     # Centroid
     # --------------------------------------------------------
@@ -544,70 +766,128 @@ for i in range(detection_count):
         contour
     )
 
+
     if moments["m00"] != 0:
 
         cx = (
-            moments["m10"] /
+            moments["m10"]
+            /
             moments["m00"]
         )
 
         cy = (
-            moments["m01"] /
+            moments["m01"]
+            /
             moments["m00"]
         )
 
     else:
 
         cx = x + w / 2
+
         cy = y + h / 2
+
 
     center = (
         float(cx),
         float(cy)
     )
 
+
     # --------------------------------------------------------
-    # Component dictionary
+    # Store component
     # --------------------------------------------------------
 
     component = {
-        "index": i,
-        "class_id": class_id,
-        "class_name": class_name,
-        "confidence": confidence,
-        "area": float(area),
-        "bbox": (
-            int(x),
-            int(y),
-            int(w),
-            int(h)
-        ),
-        "aspect_ratio": aspect_ratio,
-        "perimeter": float(perimeter),
-        "center": center,
-        "contour": contour,
+
+        "index":
+            i,
+
+        "class_id":
+            class_id,
+
+        "class_name":
+            class_name,
+
+        "confidence":
+            confidence,
+
+        "area":
+            float(area),
+
+        "bbox":
+            (
+                int(x),
+                int(y),
+                int(w),
+                int(h)
+            ),
+
+        "aspect_ratio":
+            aspect_ratio,
+
+        "perimeter":
+            float(perimeter),
+
+        "center":
+            center,
+
+        "contour":
+            contour,
     }
+
 
     components.append(
         component
     )
 
+
     # ========================================================
-    # VISUALIZATION
+    # FINAL VISUALIZATION RULE
     # ========================================================
+    #
+    # Only geometry-valid detections are drawn.
+    #
+    # Therefore:
+    #
+    # confidence >= 0.50 -> DRAW
+    # confidence <  0.50 -> DO NOT DRAW
+    #
+    # Low-confidence detections are still shown in the
+    # textual YOLO prediction report above.
+    # ========================================================
+
+    if confidence < GEOMETRY_CONFIDENCE:
+
+        continue
+
+
+    # --------------------------------------------------------
+    # Visualization color
+    # --------------------------------------------------------
 
     color = class_colors.get(
         class_id,
         (255, 255, 255)
     )
 
+
+    # --------------------------------------------------------
+    # Mask overlay
+    # --------------------------------------------------------
+
     mask_pixels = (
         binary_mask > 0
     )
 
+
     overlay = visualization.copy()
 
-    overlay[mask_pixels] = color
+
+    overlay[
+        mask_pixels
+    ] = color
+
 
     visualization = cv2.addWeighted(
         visualization,
@@ -616,6 +896,7 @@ for i in range(detection_count):
         0.30,
         0
     )
+
 
     # --------------------------------------------------------
     # Contour
@@ -629,6 +910,7 @@ for i in range(detection_count):
         2
     )
 
+
     # --------------------------------------------------------
     # Bounding box
     # --------------------------------------------------------
@@ -641,17 +923,22 @@ for i in range(detection_count):
         2
     )
 
+
     # --------------------------------------------------------
     # Center
     # --------------------------------------------------------
 
     cv2.circle(
         visualization,
-        (int(cx), int(cy)),
+        (
+            int(cx),
+            int(cy)
+        ),
         5,
         color,
         -1
     )
+
 
     # --------------------------------------------------------
     # Label
@@ -662,15 +949,20 @@ for i in range(detection_count):
         f"{confidence:.2f}"
     )
 
+
     label_y = max(
         y - 7,
         18
     )
 
+
     cv2.putText(
         visualization,
         label,
-        (x, label_y),
+        (
+            x,
+            label_y
+        ),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.55,
         color,
@@ -689,7 +981,9 @@ for component in components:
 
     cx, cy = component["center"]
 
+
     log("")
+
 
     log(
         f"{component['class_name']} | "
@@ -707,9 +1001,13 @@ for component in components:
 # ============================================================
 
 geometry_components = [
+
     component
+
     for component in components
-    if component["confidence"] >= GEOMETRY_CONFIDENCE
+
+    if component["confidence"]
+    >= GEOMETRY_CONFIDENCE
 ]
 
 
@@ -723,6 +1021,7 @@ log(
     f"Geometry confidence threshold: "
     f"{GEOMETRY_CONFIDENCE:.2f}"
 )
+
 
 log(
     f"Geometry-valid components: "
@@ -747,25 +1046,30 @@ back = get_largest_component(
     "back_cushion"
 )
 
+
 base = get_largest_component(
     geometry_components,
     "base"
 )
+
 
 seat = get_largest_component(
     geometry_components,
     "seat_cushion"
 )
 
+
 left_arm_candidates = get_components(
     geometry_components,
     "left_arm"
 )
 
+
 right_arm_candidates = get_components(
     geometry_components,
     "right_arm"
 )
+
 
 legs = get_components(
     geometry_components,
@@ -774,17 +1078,38 @@ legs = get_components(
 
 
 # ============================================================
-# PHYSICAL ARM ORDER
+# PHYSICAL LEFT / RIGHT ARM DETECTION
+# ============================================================
+#
+# Important:
+#
+# The YOLO class names are:
+#
+#     left_arm
+#     right_arm
+#
+# But the model can occasionally assign the labels
+# opposite to the actual image position.
+#
+# Therefore, geometry uses horizontal image position:
+#
+# smallest X center = physical LEFT
+# largest X center  = physical RIGHT
+#
+# The original YOLO class name is retained and reported.
 # ============================================================
 
 all_arms = (
-    left_arm_candidates +
+    left_arm_candidates
+    +
     right_arm_candidates
 )
 
+
 all_arms = sorted(
     all_arms,
-    key=lambda component: component["center"][0]
+    key=lambda component:
+        component["center"][0]
 )
 
 
@@ -795,17 +1120,91 @@ physical_right_arm = None
 if len(all_arms) >= 2:
 
     physical_left_arm = all_arms[0]
+
     physical_right_arm = all_arms[-1]
+
 
 elif len(all_arms) == 1:
 
-    if all_arms[0]["center"][0] < width / 2:
+    if (
+        all_arms[0]["center"][0]
+        <
+        width / 2
+    ):
 
         physical_left_arm = all_arms[0]
 
     else:
 
         physical_right_arm = all_arms[0]
+
+
+# ============================================================
+# REPORT PHYSICAL ARM ASSIGNMENT
+# ============================================================
+
+log("")
+log("==============================================")
+log("PHYSICAL ARM ASSIGNMENT")
+log("==============================================")
+
+
+if physical_left_arm is not None:
+
+    log(
+        "Physical LEFT arm:"
+    )
+
+    log(
+        f"  YOLO class = "
+        f"{physical_left_arm['class_name']}"
+    )
+
+    log(
+        f"  confidence = "
+        f"{physical_left_arm['confidence']:.3f}"
+    )
+
+    log(
+        f"  center = "
+        f"({physical_left_arm['center'][0]:.1f}, "
+        f"{physical_left_arm['center'][1]:.1f})"
+    )
+
+else:
+
+    log(
+        "Physical LEFT arm: N/A"
+    )
+
+
+if physical_right_arm is not None:
+
+    log(
+        "Physical RIGHT arm:"
+    )
+
+    log(
+        f"  YOLO class = "
+        f"{physical_right_arm['class_name']}"
+    )
+
+    log(
+        f"  confidence = "
+        f"{physical_right_arm['confidence']:.3f}"
+    )
+
+    log(
+        f"  center = "
+        f"({physical_right_arm['center'][0]:.1f}, "
+        f"{physical_right_arm['center'][1]:.1f})"
+    )
+
+else:
+
+    log(
+        "Physical RIGHT arm: N/A"
+    )
 
 
 # ============================================================
@@ -834,7 +1233,8 @@ if (
     )
 
     log(
-        f"Left arm <-> Right arm center distance: "
+        f"Physical left arm <-> "
+        f"physical right arm center distance: "
         f"{arm_center_distance:.2f} px"
     )
 
@@ -843,7 +1243,8 @@ else:
     arm_center_distance = None
 
     log(
-        "Left arm <-> Right arm center distance: N/A"
+        "Physical left arm <-> "
+        "physical right arm center distance: N/A"
     )
 
 
@@ -851,7 +1252,11 @@ else:
 # Seat/back distance
 # ------------------------------------------------------------
 
-if seat is not None and back is not None:
+if (
+    seat is not None
+    and
+    back is not None
+):
 
     seat_back_distance = center_distance(
         seat,
@@ -888,7 +1293,8 @@ if (
     )
 
     log(
-        f"Left arm <-> Seat center distance: "
+        f"Physical left arm <-> Seat "
+        f"center distance: "
         f"{left_arm_seat_distance:.2f} px"
     )
 
@@ -897,7 +1303,8 @@ else:
     left_arm_seat_distance = None
 
     log(
-        "Left arm <-> Seat center distance: N/A"
+        "Physical left arm <-> Seat "
+        "center distance: N/A"
     )
 
 
@@ -917,7 +1324,8 @@ if (
     )
 
     log(
-        f"Right arm <-> Seat center distance: "
+        f"Physical right arm <-> Seat "
+        f"center distance: "
         f"{right_arm_seat_distance:.2f} px"
     )
 
@@ -926,7 +1334,8 @@ else:
     right_arm_seat_distance = None
 
     log(
-        "Right arm <-> Seat center distance: N/A"
+        "Physical right arm <-> Seat "
+        "center distance: N/A"
     )
 
 
@@ -995,7 +1404,9 @@ if geometry_boxes:
 else:
 
     overall_width = None
+
     overall_height = None
+
     overall_aspect_ratio = None
 
 
@@ -1004,10 +1415,12 @@ log(
     f"{format_value(overall_width)} px"
 )
 
+
 log(
     f"Overall height: "
     f"{format_value(overall_height)} px"
 )
+
 
 log(
     f"Overall aspect ratio: "
@@ -1059,9 +1472,13 @@ log("==============================================")
 seat_quality = "UNDETERMINED"
 
 seat_confidence = None
+
 seat_width = None
+
 seat_height = None
+
 seat_area = None
+
 seat_aspect_ratio = None
 
 
@@ -1073,16 +1490,29 @@ if seat is None:
 
 else:
 
-    seat_confidence = seat["confidence"]
+    seat_confidence = seat[
+        "confidence"
+    ]
 
-    x, y, w, h = seat["bbox"]
+    x, y, w, h = seat[
+        "bbox"
+    ]
 
     seat_width = w
+
     seat_height = h
-    seat_area = seat["area"]
-    seat_aspect_ratio = seat["aspect_ratio"]
+
+    seat_area = seat[
+        "area"
+    ]
+
+    seat_aspect_ratio = seat[
+        "aspect_ratio"
+    ]
+
 
     concerns = []
+
 
     if seat_confidence < GEOMETRY_CONFIDENCE:
 
@@ -1090,17 +1520,20 @@ else:
             "low confidence"
         )
 
+
     if seat_height < 30:
 
         concerns.append(
             "very small seat height"
         )
 
+
     if seat_aspect_ratio > 10:
 
         concerns.append(
             "extreme aspect ratio"
         )
+
 
     if seat_area < 500:
 
@@ -1127,36 +1560,43 @@ else:
         f"{seat_confidence:.3f}"
     )
 
+
     log(
         f"Seat width: "
         f"{seat_width} px"
     )
+
 
     log(
         f"Seat height: "
         f"{seat_height} px"
     )
 
+
     log(
         f"Seat area: "
         f"{seat_area:.1f} px2"
     )
+
 
     log(
         f"Seat aspect ratio: "
         f"{seat_aspect_ratio:.2f}"
     )
 
+
     log(
         f"Seat mask quality: "
         f"{seat_quality}"
     )
 
+
     if concerns:
 
         log(
             "Seat mask concerns: "
-            + ", ".join(concerns)
+            +
+            ", ".join(concerns)
         )
 
 
@@ -1171,21 +1611,25 @@ log("==============================================")
 
 
 seat_width_ratio = None
+
 seat_back_area_ratio = None
+
 left_right_arm_area_ratio = None
 
 
 if seat is not None:
 
     log(
-        f"Seat width: "
+        f"Detected seat bounding-box width: "
         f"{seat_width} px"
     )
+
 
     log(
         f"Seat height: "
         f"{seat_height} px"
     )
+
 
     log(
         f"Seat aspect ratio: "
@@ -1205,14 +1649,14 @@ if seat is not None:
         )
 
         log(
-            f"Seat / overall width: "
+            f"Seat bounding-box / overall width: "
             f"{seat_width_ratio:.4f}"
         )
 
     else:
 
         log(
-            "Seat / overall width: N/A"
+            "Seat bounding-box / overall width: N/A"
         )
 
 
@@ -1255,14 +1699,16 @@ if seat is not None:
         )
 
         log(
-            f"Left / Right arm area ratio: "
+            f"Physical left / physical right "
+            f"arm area ratio: "
             f"{left_right_arm_area_ratio:.4f}"
         )
 
     else:
 
         log(
-            "Left / Right arm area ratio: N/A"
+            "Physical left / physical right "
+            "arm area ratio: N/A"
         )
 
 else:
@@ -1283,6 +1729,7 @@ log("==============================================")
 
 
 arm_center_span = None
+
 arm_inner_span = None
 
 
@@ -1293,7 +1740,7 @@ if (
 ):
 
     # --------------------------------------------------------
-    # Center-to-center span
+    # Arm center-to-center span
     # --------------------------------------------------------
 
     arm_center_span = center_distance(
@@ -1308,33 +1755,61 @@ if (
 
 
     # --------------------------------------------------------
-    # Inner bounding-box span
+    # Physical inner edges
     # --------------------------------------------------------
 
-    left_x = physical_left_arm["bbox"][0]
-    left_width = physical_left_arm["bbox"][2]
-
-    right_x = physical_right_arm["bbox"][0]
-
-    left_inner_edge = (
-        left_x +
-        left_width
+    left_arm_x = (
+        physical_left_arm["bbox"][0]
     )
 
-    right_inner_edge = right_x
+    left_arm_width = (
+        physical_left_arm["bbox"][2]
+    )
+
+    right_arm_x = (
+        physical_right_arm["bbox"][0]
+    )
+
+
+    left_inner_edge = (
+        left_arm_x
+        +
+        left_arm_width
+    )
+
+
+    right_inner_edge = (
+        right_arm_x
+    )
+
 
     arm_inner_span = max(
         0.0,
         float(
-            right_inner_edge -
+            right_inner_edge
+            -
             left_inner_edge
         )
     )
 
+
     log(
-        f"Arm bounding-box inner span: "
+        f"Physical left arm inner edge: "
+        f"{left_inner_edge} px"
+    )
+
+
+    log(
+        f"Physical right arm inner edge: "
+        f"{right_inner_edge} px"
+    )
+
+
+    log(
+        f"Usable arm-to-arm inner span: "
         f"{arm_inner_span:.2f} px"
     )
+
 
 else:
 
@@ -1344,82 +1819,79 @@ else:
 
 
 # ============================================================
-# SEAT SPAN RELATIONSHIP
+# CORRECTED USABLE SEAT SPAN
 # ============================================================
 
 log("")
 log("==============================================")
-log("SEAT SPAN RELATIONSHIP")
+log("USABLE SEAT SPAN")
 log("==============================================")
 
 
-seat_span = None
-seat_center_span = None
-seat_inner_span_ratio = None
-seat_center_span_ratio = None
+usable_seat_span = None
+
+seat_span_ratio = None
 
 
-if seat is not None:
+if (
+    seat is not None
+    and
+    physical_left_arm is not None
+    and
+    physical_right_arm is not None
+):
 
-    # Width of the selected main seat cushion
-    seat_span = float(
-        seat["bbox"][2]
+    usable_seat_span = calculate_usable_seat_span(
+        seat,
+        physical_left_arm,
+        physical_right_arm
     )
+
 
     log(
-        f"Main seat cushion span: "
-        f"{seat_span:.2f} px"
+        f"Detected seat bounding-box span: "
+        f"{seat['bbox'][2]} px"
     )
 
-    # --------------------------------------------------------
-    # Seat width relative to arm inner span
-    # --------------------------------------------------------
+
+    log(
+        f"Usable seat span between arm inner edges: "
+        f"{usable_seat_span:.2f} px"
+    )
+
 
     if arm_inner_span is not None:
 
-        seat_inner_span_ratio = safe_ratio(
-            seat_span,
+        seat_span_ratio = safe_ratio(
+            usable_seat_span,
             arm_inner_span
         )
 
+
         log(
-            f"Seat span / arm inner span: "
-            f"{seat_inner_span_ratio:.4f}"
+            f"Usable seat span / "
+            f"arm inner span: "
+            f"{seat_span_ratio:.4f}"
         )
+
 
     else:
 
         log(
-            "Seat span / arm inner span: N/A"
+            "Usable seat span / "
+            "arm inner span: N/A"
         )
 
-
-    # --------------------------------------------------------
-    # Seat width relative to arm center span
-    # --------------------------------------------------------
-
-    if arm_center_span is not None:
-
-        seat_center_span_ratio = safe_ratio(
-            seat_span,
-            arm_center_span
-        )
-
-        log(
-            f"Seat span / arm center span: "
-            f"{seat_center_span_ratio:.4f}"
-        )
-
-    else:
-
-        log(
-            "Seat span / arm center span: N/A"
-        )
 
 else:
 
     log(
-        "Main seat span: N/A"
+        "Usable seat span: N/A"
+    )
+
+    log(
+        "Reason: seat and both physical arms "
+        "are required."
     )
 
 
@@ -1478,6 +1950,7 @@ if seat is None:
         "Reason: no geometry-valid seat mask."
     )
 
+
 elif seat_quality in [
     "WEAK",
     "POOR"
@@ -1492,19 +1965,18 @@ elif seat_quality in [
         f"{seat_quality}."
     )
 
-elif (
-    seat_center_span_ratio is None
-    and
-    seat_inner_span_ratio is None
-):
+
+elif seat_span_ratio is None:
 
     log(
         "Seater analysis: UNDETERMINED"
     )
 
     log(
-        "Reason: insufficient arm/seat geometry."
+        "Reason: usable seat span could not "
+        "be calculated."
     )
+
 
 else:
 
@@ -1513,24 +1985,18 @@ else:
         "for preliminary analysis."
     )
 
-    if seat_inner_span_ratio is not None:
 
-        log(
-            f"Seat / arm inner-span ratio: "
-            f"{seat_inner_span_ratio:.4f}"
-        )
+    log(
+        f"Usable seat span ratio: "
+        f"{seat_span_ratio:.4f}"
+    )
 
-    if seat_center_span_ratio is not None:
-
-        log(
-            f"Seat / arm center-span ratio: "
-            f"{seat_center_span_ratio:.4f}"
-        )
 
     log(
         f"Seat aspect ratio: "
         f"{seat_aspect_ratio:.2f}"
     )
+
 
     log(
         f"Seat cushion count: "
@@ -1542,29 +2008,22 @@ else:
     # Geometry interpretation
     # --------------------------------------------------------
 
-    ratio_for_interpretation = (
-        seat_inner_span_ratio
-        if seat_inner_span_ratio is not None
-        else seat_center_span_ratio
-    )
-
-
-    if ratio_for_interpretation >= 0.80:
+    if seat_span_ratio >= 0.80:
 
         geometry_interpretation = (
-            "long continuous seating span"
+            "long continuous usable seating span"
         )
 
-    elif ratio_for_interpretation >= 0.55:
+    elif seat_span_ratio >= 0.55:
 
         geometry_interpretation = (
-            "moderate seating span"
+            "moderate usable seating span"
         )
 
     else:
 
         geometry_interpretation = (
-            "short seating span"
+            "short usable seating span"
         )
 
 
@@ -1573,17 +2032,21 @@ else:
         f"{geometry_interpretation}"
     )
 
+
     log("")
+
 
     log(
         "Preliminary seater interpretation: "
         "requires calibration."
     )
 
+
     log(
         "A single continuous cushion is NOT "
         "automatically treated as one seater."
     )
+
 
     log(
         "Seater reasoning should combine seat "
@@ -1613,7 +2076,7 @@ feature_vector = {
     "overall_aspect_ratio":
         overall_aspect_ratio,
 
-    "seat_width_px":
+    "seat_bbox_width_px":
         seat_width,
 
     "seat_height_px":
@@ -1625,7 +2088,7 @@ feature_vector = {
     "seat_aspect_ratio":
         seat_aspect_ratio,
 
-    "seat_width_ratio":
+    "seat_bbox_width_ratio":
         seat_width_ratio,
 
     "arm_center_span_px":
@@ -1634,11 +2097,11 @@ feature_vector = {
     "arm_inner_span_px":
         arm_inner_span,
 
-    "seat_inner_span_ratio":
-        seat_inner_span_ratio,
+    "usable_seat_span_px":
+        usable_seat_span,
 
-    "seat_center_span_ratio":
-        seat_center_span_ratio,
+    "usable_seat_span_ratio":
+        seat_span_ratio,
 
     "seat_cushion_count":
         seat_cushion_count,
@@ -1660,7 +2123,8 @@ feature_vector = {
 for key, value in feature_vector.items():
 
     log(
-        f"{key} = {format_value(value)}"
+        f"{key} = "
+        f"{format_value(value)}"
     )
 
 
@@ -1678,43 +2142,58 @@ log(
     "Measurements are image-space pixels."
 )
 
+
 log(
     "Pixel measurements do not represent real "
     "physical dimensions without scale or calibration."
 )
 
+
 log(
-    "Perspective and camera angle can change measured "
-    "geometry."
+    "Perspective and camera angle can change "
+    "measured geometry."
 )
+
 
 log(
     "Sofa design can change the visible geometry."
 )
+
 
 log(
     "A single continuous cushion does not by itself "
     "determine seating capacity."
 )
 
+
 log(
     "Multiple seat cushions do not automatically "
     "guarantee a specific seating capacity."
 )
 
+
+log(
+    "The physical left/right arm assignment is based "
+    "on horizontal image position, not only YOLO class name."
+)
+
+
+log(
+    "Low-confidence detections are included in the "
+    "prediction report but are excluded from geometry "
+    "and final visualization when confidence is below "
+    f"{GEOMETRY_CONFIDENCE:.2f}."
+)
+
+
 log(
     "Seater classification is an image-based inference."
 )
 
+
 log(
     "The current seater interpretation is deliberately "
     "preliminary and requires calibration."
-)
-
-log(
-    "Low-confidence YOLO detections are displayed "
-    "for debugging but excluded from geometry when "
-    f"confidence < {GEOMETRY_CONFIDENCE:.2f}."
 )
 
 
@@ -1732,6 +2211,7 @@ log(
     f"Visualization: {IMAGE_OUTPUT}"
 )
 
+
 log(
     f"Text report: {TEXT_OUTPUT}"
 )
@@ -1747,16 +2227,16 @@ success = cv2.imwrite(
 )
 
 
-if not success:
+if success:
 
     log(
-        "WARNING: Could not save visualization."
+        "Visualization saved successfully."
     )
 
 else:
 
     log(
-        "Visualization saved successfully."
+        "WARNING: Could not save visualization."
     )
 
 
@@ -1776,18 +2256,22 @@ print("==============================================")
 print("ANALYSIS COMPLETE")
 print("==============================================")
 
+
 print(
     f"Text report: {TEXT_OUTPUT}"
 )
+
 
 print(
     f"Visualization: {IMAGE_OUTPUT}"
 )
 
+
 print(
     f"Valid geometry components: "
     f"{len(geometry_components)}"
 )
+
 
 print(
     f"Seat cushion components: "
