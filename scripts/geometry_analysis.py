@@ -1,109 +1,59 @@
 """
 sofa_geometry_analysis.py
 
-Sofa component detection + geometry analysis + seater classification.
+YOLO11 segmentation + sofa geometry + seater classification.
 
-YOLO classes:
-    0 -> back_cushion
-    1 -> base
-    2 -> left_arm
-    3 -> legs
-    4 -> right_arm
-    5 -> seat_cushion
+FINAL VISUALIZATION:
+    SOFA TYPE: 2-seater
+    CONFIDENCE: 90.0%
 
-IMPORTANT:
-    YOLO component count is NOT the same as sofa seat count.
+    Original YOLO class names are preserved:
+        back_cushion
+        base
+        left_arm
+        legs
+        right_arm
+        seat_cushion
 
-Example:
-    One continuous seat cushion can represent a 2-seater or 3-seater.
+    No PHYSICAL LEFT/RIGHT labels are displayed.
+    No bounding boxes are displayed.
 
-Therefore the final seater type is estimated from geometry:
-    - overall sofa width
-    - physical arm positions
-    - usable seating span
-    - seat cushion width
-    - seat/sofa width ratio
-    - seat/usable-span ratio
-    - back cushion count as supporting evidence
+OUTPUT DIRECTORY:
+    runs/geometry/
 
-OUTPUTS:
-    runs/
-        geometry/
-            geometry_result.json
-            geometry_result.txt
-            geometry_result.jpg
-            sofa_background_removed.png
+OUTPUT FILES:
+    runs/geometry/sofa_geometry_result.png
+    runs/geometry/geometry_result.txt
+    runs/geometry/geometry_report.json
 
-Usage:
-    python .\scripts\sofa_geometry_analysis.py
+USAGE:
 
-The program will ask:
-    Enter path to sofa image:
+    python scripts/geometry_analysis.py
 
-Optional:
-    python .\scripts\sofa_geometry_analysis.py --no-bg-removal
+or:
+
+    python scripts/geometry_analysis.py --image "path/to/sofa.jpg"
+
+Model:
+    runs/segment/models/sofa_yolo11n_seg_v1-2/weights/best.pt
 """
 
 import argparse
 import json
 import os
-import shutil
 import sys
-import tempfile
-import time
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Dict, Tuple
+
 
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
 
-# ============================================================================
-# OPTIONAL BACKGROUND REMOVAL
-# ============================================================================
-
-try:
-    from rembg import remove as rembg_remove
-
-    REMBG_AVAILABLE = True
-
-except ImportError:
-    REMBG_AVAILABLE = False
-
-
-# ============================================================================
-# PROJECT PATHS
-# ============================================================================
-
-SCRIPT_DIR = os.path.dirname(
-    os.path.abspath(__file__)
-)
-
-PROJECT_ROOT = os.path.dirname(
-    SCRIPT_DIR
-)
-
-OUTPUT_DIR = os.path.join(
-    PROJECT_ROOT,
-    "runs",
-    "geometry"
-)
-
-DEFAULT_WEIGHTS = os.path.join(
-    PROJECT_ROOT,
-    "runs",
-    "segment",
-    "models",
-    "sofa_yolo11n_seg_v1-2",
-    "weights",
-    "best.pt"
-)
-
-
-# ============================================================================
-# YOLO CLASSES
-# ============================================================================
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 CLASS_NAMES = [
     "back_cushion",
@@ -115,428 +65,192 @@ CLASS_NAMES = [
 ]
 
 
-# ============================================================================
-# GEOMETRY SETTINGS
-# ============================================================================
+MODEL_PATH = (
+    r".\runs\segment\models\sofa_yolo11n_seg_v1-2\weights\best.pt"
+)
 
-# Very small masks are normally noise.
-MIN_COMPONENT_AREA = 100
 
-# Geometry confidence threshold.
+OUTPUT_DIR = r".\runs\geometry"
+
+
+# YOLO detection threshold.
+PREDICTION_CONFIDENCE = 0.25
+
+
+# Only detections above this threshold are used for geometry.
 GEOMETRY_CONFIDENCE = 0.50
 
-# Detection confidence.
-DEFAULT_CONFIDENCE = 0.25
 
-# ---------------------------------------------------------------------------
-# Continuous-cushion classification thresholds.
-#
-# These are image-space ratios, so no cm calibration is required.
-#
-# Main ratio:
-#
-#     seat cushion width / overall sofa width
-#
-# Typical interpretation:
-#
-#     < 0.55  -> 1-seater
-#     0.55-0.76 -> 2-seater
-#     0.76-0.92 -> 3-seater
-#     > 0.92 -> 4-seater
-#
-# These are deliberately used together with other geometry signals rather
-# than as a single hard rule.
-# ---------------------------------------------------------------------------
-
-SEAT_RATIO_1_MAX = 0.55
-SEAT_RATIO_2_MAX = 0.76
-SEAT_RATIO_3_MAX = 0.92
-
-# Arm inner span ratio.
-INNER_SPAN_1_MAX = 0.48
-INNER_SPAN_2_MAX = 0.72
-INNER_SPAN_3_MAX = 0.86
-
-# Seat cushion aspect ratio.
-# Very short/wide cushions are unlikely to represent a single seat.
-SEAT_AR_2_MIN = 2.5
-SEAT_AR_3_MIN = 4.0
-SEAT_AR_4_MIN = 5.5
+# Minimum segmentation mask area.
+MIN_COMPONENT_AREA = 100
 
 
-# ============================================================================
-# DATA CLASSES
-# ============================================================================
+# ============================================================
+# DATA STRUCTURE
+# ============================================================
 
 @dataclass
-class ComponentInstance:
+class Component:
 
     cls_name: str
+
+    confidence: float
 
     mask: np.ndarray
 
     bbox: Tuple[int, int, int, int]
 
-    area_px: int
-
-    confidence: float
+    area_px: float
 
     @property
-    def width_px(self) -> int:
+    def x1(self):
+        return self.bbox[0]
+
+    @property
+    def y1(self):
+        return self.bbox[1]
+
+    @property
+    def x2(self):
+        return self.bbox[2]
+
+    @property
+    def y2(self):
+        return self.bbox[3]
+
+    @property
+    def width(self):
         return max(
             0,
-            self.bbox[2] - self.bbox[0]
+            self.x2 - self.x1
         )
 
     @property
-    def height_px(self) -> int:
+    def height(self):
         return max(
             0,
-            self.bbox[3] - self.bbox[1]
+            self.y2 - self.y1
         )
 
     @property
-    def center_x(self) -> float:
+    def center_x(self):
         return (
-            self.bbox[0] +
-            self.bbox[2]
+            self.x1 + self.x2
         ) / 2.0
 
     @property
-    def center_y(self) -> float:
+    def center_y(self):
         return (
-            self.bbox[1] +
-            self.bbox[3]
+            self.y1 + self.y2
         ) / 2.0
 
-    @property
-    def aspect_ratio(self) -> float:
 
-        if self.height_px <= 0:
-            return 0.0
-
-        return (
-            self.width_px /
-            self.height_px
-        )
-
-
-@dataclass
-class SeaterCandidate:
-
-    source: str
-
-    count: int
-
-    confidence: float
-
-    note: str = ""
-
-
-@dataclass
-class SofaGeometryReport:
-
-    seater_type: str
-
-    seat_count_final: int
-
-    seater_confidence: float
-
-    chosen_source: str
-
-    overall_width_px: float
-
-    overall_height_px: float
-
-    arm_inner_span_px: Optional[float]
-
-    seat_width_px: Optional[float]
-
-    seat_height_px: Optional[float]
-
-    seat_aspect_ratio: Optional[float]
-
-    seat_to_overall_ratio: Optional[float]
-
-    seat_to_inner_span_ratio: Optional[float]
-
-    inner_span_to_overall_ratio: Optional[float]
-
-    seat_cushion_count: int
-
-    back_cushion_count: int
-
-    physical_left_arm_class: Optional[str]
-
-    physical_right_arm_class: Optional[str]
-
-    physical_left_arm_confidence: Optional[float]
-
-    physical_right_arm_confidence: Optional[float]
-
-    visible_leg_count: int
-
-    shape: str
-
-    is_sectional: bool
-
-    solidity: float
-
-    components_detected: List[str] = field(
-        default_factory=list
-    )
-
-    warnings: List[str] = field(
-        default_factory=list
-    )
-
-    explanation: List[str] = field(
-        default_factory=list
-    )
-
-    def to_dict(self) -> Dict:
-
-        return self.__dict__
-
-
-# ============================================================================
-# ANALYZER
-# ============================================================================
+# ============================================================
+# MAIN ANALYZER
+# ============================================================
 
 class SofaGeometryAnalyzer:
 
     def __init__(
         self,
-        weights_path: str,
-        conf: float = DEFAULT_CONFIDENCE,
+        model_path=MODEL_PATH,
+        prediction_confidence=PREDICTION_CONFIDENCE,
+        geometry_confidence=GEOMETRY_CONFIDENCE,
     ):
 
-        print("\nLoading YOLO model...")
+        print()
+        print("=" * 70)
+        print("LOADING SOFA YOLO MODEL")
+        print("=" * 70)
 
-        self.model = YOLO(
-            weights_path
+        if not os.path.isfile(model_path):
+
+            raise FileNotFoundError(
+                f"\nModel not found:\n{os.path.abspath(model_path)}"
+            )
+
+        self.model = YOLO(model_path)
+
+        self.prediction_confidence = (
+            prediction_confidence
         )
 
-        self.conf = conf
+        self.geometry_confidence = (
+            geometry_confidence
+        )
+
+        print(
+            f"Model path: {model_path}"
+        )
+
+        print(
+            f"Classes: {self.model.names}"
+        )
 
         print(
             "Model loaded successfully."
         )
 
-        print(
-            f"Model: {weights_path}"
-        )
-
-        print(
-            f"Prediction confidence: {conf}"
-        )
-
-        print(
-            f"Geometry confidence: "
-            f"{GEOMETRY_CONFIDENCE}"
-        )
-
-
-    # ========================================================================
-    # BACKGROUND REMOVAL
-    # ========================================================================
-
-    def remove_background(
-        self,
-        image_path: str
-    ) -> str:
-
-        """
-        Remove background using rembg.
-
-        Returns a temporary RGB image path.
-
-        If rembg is unavailable, returns original image.
-        """
-
-        if not REMBG_AVAILABLE:
-
-            print(
-                "\n[WARNING] rembg is not installed."
-            )
-
-            print(
-                "Skipping background removal."
-            )
-
-            print(
-                'Install with: '
-                'python -m pip install "rembg[cpu]"'
-            )
-
-            return image_path
-
-        try:
-
-            with open(
-                image_path,
-                "rb"
-            ) as f:
-
-                input_bytes = f.read()
-
-            output_bytes = rembg_remove(
-                input_bytes
-            )
-
-            from PIL import Image
-            import io
-
-            fg = Image.open(
-                io.BytesIO(
-                    output_bytes
-                )
-            ).convert("RGBA")
-
-            # Transparent pixels become white.
-            background = Image.new(
-                "RGB",
-                fg.size,
-                (255, 255, 255)
-            )
-
-            background.paste(
-                fg,
-                mask=fg.getchannel("A")
-            )
-
-            temp_fd, temp_path = tempfile.mkstemp(
-                suffix="_nobg.png"
-            )
-
-            os.close(
-                temp_fd
-            )
-
-            background.save(
-                temp_path
-            )
-
-            return temp_path
-
-        except Exception as exc:
-
-            print(
-                f"\n[WARNING] Background removal failed: "
-                f"{exc}"
-            )
-
-            return image_path
-
-
-    # ========================================================================
-    # SAVE BACKGROUND REMOVED IMAGE
-    # ========================================================================
-
-    def save_background_removed_image(
-        self,
-        processed_path: str,
-        original_path: str
-    ) -> str:
-
-        os.makedirs(
-            OUTPUT_DIR,
-            exist_ok=True
-        )
-
-        output_path = os.path.join(
-            OUTPUT_DIR,
-            "sofa_background_removed.png"
-        )
-
-        try:
-
-            if processed_path != original_path:
-
-                shutil.copy2(
-                    processed_path,
-                    output_path
-                )
-
-            else:
-
-                image = cv2.imread(
-                    original_path
-                )
-
-                if image is not None:
-
-                    cv2.imwrite(
-                        output_path,
-                        image
-                    )
-
-        except Exception as exc:
-
-            print(
-                f"[WARNING] Could not save "
-                f"background-removed image: {exc}"
-            )
-
-        return output_path
-
-
-    # ========================================================================
-    # YOLO INFERENCE
-    # ========================================================================
+    # ========================================================
+    # YOLO SEGMENTATION
+    # ========================================================
 
     def run_inference(
         self,
-        image_path: str
-    ) -> List[ComponentInstance]:
+        image_path
+    ):
 
         results = self.model.predict(
-            image_path,
-            conf=self.conf,
+            source=image_path,
+            conf=self.prediction_confidence,
+            retina_masks=True,
             verbose=False,
-            retina_masks=True
-        )[0]
+        )
 
-        instances = []
+        if not results:
 
-        if results.masks is None:
+            return None, []
 
-            return instances
+        result = results[0]
 
-        img_h, img_w = results.orig_shape
+        image = result.orig_img.copy()
 
-        masks = (
-            results.masks.data
-            .cpu()
-            .numpy()
+        if result.masks is None:
+
+            return image, []
+
+        image_height, image_width = (
+            image.shape[:2]
         )
 
         boxes = (
-            results.boxes.xyxy
+            result.boxes.xyxy
             .cpu()
             .numpy()
         )
 
-        classes = (
-            results.boxes.cls
+        class_ids = (
+            result.boxes.cls
             .cpu()
             .numpy()
             .astype(int)
         )
 
         confidences = (
-            results.boxes.conf
+            result.boxes.conf
             .cpu()
             .numpy()
         )
 
-        for i in range(
-            len(classes)
+        polygons = result.masks.xy
+
+        components = []
+
+        for index in range(
+            len(class_ids)
         ):
 
-            class_id = int(
-                classes[i]
-            )
+            class_id = class_ids[index]
 
             if (
                 class_id < 0
@@ -544,1131 +258,1418 @@ class SofaGeometryAnalyzer:
             ):
                 continue
 
-            mask = cv2.resize(
-                masks[i].astype(
-                    np.uint8
-                ),
-                (
-                    img_w,
-                    img_h
-                ),
-                interpolation=cv2.INTER_NEAREST
+            class_name = CLASS_NAMES[
+                class_id
+            ]
+
+            confidence = float(
+                confidences[index]
             )
 
-            x1, y1, x2, y2 = boxes[i]
+            polygon = polygons[index]
 
-            instance = ComponentInstance(
+            mask = np.zeros(
+                (
+                    image_height,
+                    image_width,
+                ),
+                dtype=np.uint8,
+            )
 
-                cls_name=CLASS_NAMES[
-                    class_id
-                ],
+            if (
+                polygon is not None
+                and len(polygon) >= 3
+            ):
 
+                polygon_points = (
+                    np.round(
+                        polygon
+                    ).astype(
+                        np.int32
+                    )
+                )
+
+                cv2.fillPoly(
+                    mask,
+                    [polygon_points],
+                    255,
+                )
+
+            area = float(
+                cv2.countNonZero(
+                    mask
+                )
+            )
+
+            x1, y1, x2, y2 = (
+                boxes[index]
+            )
+
+            component = Component(
+                cls_name=class_name,
+                confidence=confidence,
                 mask=mask,
-
                 bbox=(
                     int(x1),
                     int(y1),
                     int(x2),
-                    int(y2)
+                    int(y2),
                 ),
-
-                area_px=int(
-                    mask.sum()
-                ),
-
-                confidence=float(
-                    confidences[i]
-                )
+                area_px=area,
             )
 
-            instances.append(
-                instance
+            components.append(
+                component
             )
 
-        return instances
+        return image, components
 
-
-    # ========================================================================
-    # IOU
-    # ========================================================================
+    # ========================================================
+    # MASK IOU
+    # ========================================================
 
     @staticmethod
-    def calculate_iou(
-        a: ComponentInstance,
-        b: ComponentInstance
-    ) -> float:
+    def mask_iou(
+        first,
+        second
+    ):
 
-        ax1, ay1, ax2, ay2 = a.bbox
+        mask_a = first.mask > 0
+        mask_b = second.mask > 0
 
-        bx1, by1, bx2, by2 = b.bbox
+        intersection = np.logical_and(
+            mask_a,
+            mask_b,
+        ).sum()
 
-        ix1 = max(
-            ax1,
-            bx1
-        )
+        union = np.logical_or(
+            mask_a,
+            mask_b,
+        ).sum()
 
-        iy1 = max(
-            ay1,
-            by1
-        )
-
-        ix2 = min(
-            ax2,
-            bx2
-        )
-
-        iy2 = min(
-            ay2,
-            by2
-        )
-
-        iw = max(
-            0,
-            ix2 - ix1
-        )
-
-        ih = max(
-            0,
-            iy2 - iy1
-        )
-
-        intersection = (
-            iw * ih
-        )
-
-        if intersection <= 0:
+        if union == 0:
 
             return 0.0
 
-        area_a = (
-            max(
-                0,
-                ax2 - ax1
-            )
-            *
-            max(
-                0,
-                ay2 - ay1
-            )
+        return float(
+            intersection / union
         )
 
-        area_b = (
-            max(
-                0,
-                bx2 - bx1
-            )
-            *
-            max(
-                0,
-                by2 - by1
-            )
-        )
-
-        union = (
-            area_a
-            + area_b
-            - intersection
-        )
-
-        if union <= 0:
-
-            return 0.0
-
-        return (
-            intersection /
-            union
-        )
-
-
-    # ========================================================================
+    # ========================================================
     # DEDUPLICATION
-    # ========================================================================
+    # ========================================================
 
-    def deduplicate_instances(
+    def deduplicate_components(
         self,
-        instances: List[ComponentInstance],
-        iou_threshold: float = 0.55
-    ) -> List[ComponentInstance]:
+        components,
+        iou_threshold=0.60,
+    ):
 
-        by_class = {}
+        grouped = {}
 
-        for instance in instances:
+        for component in components:
 
-            by_class.setdefault(
-                instance.cls_name,
+            grouped.setdefault(
+                component.cls_name,
                 []
             ).append(
-                instance
+                component
             )
 
-        kept = []
+        final_components = []
 
-        for cls_name, group in by_class.items():
+        for class_name, group in (
+            grouped.items()
+        ):
 
             group = sorted(
                 group,
-                key=lambda x: x.confidence,
-                reverse=True
+                key=lambda item:
+                    item.confidence,
+                reverse=True,
             )
 
-            chosen = []
+            kept = []
 
             for candidate in group:
 
                 duplicate = False
 
-                for existing in chosen:
+                for existing in kept:
 
                     if (
-                        self.calculate_iou(
+                        self.mask_iou(
                             candidate,
-                            existing
+                            existing,
                         )
                         >= iou_threshold
                     ):
 
                         duplicate = True
+
                         break
 
                 if not duplicate:
 
-                    chosen.append(
+                    kept.append(
                         candidate
                     )
 
-            kept.extend(
-                chosen
+            final_components.extend(
+                kept
             )
 
-        return kept
+        return final_components
 
+    # ========================================================
+    # GEOMETRY VALID COMPONENTS
+    # ========================================================
 
-    # ========================================================================
-    # GEOMETRY FILTER
-    # ========================================================================
-
-    def geometry_valid_components(
+    def get_geometry_components(
         self,
-        instances: List[ComponentInstance]
-    ) -> List[ComponentInstance]:
+        components
+    ):
 
         valid = []
 
-        for instance in instances:
+        for component in components:
 
             if (
-                instance.confidence
-                < GEOMETRY_CONFIDENCE
+                component.confidence
+                < self.geometry_confidence
             ):
                 continue
 
             if (
-                instance.area_px
+                component.area_px
                 < MIN_COMPONENT_AREA
             ):
                 continue
 
             valid.append(
-                instance
+                component
             )
 
         return valid
 
+    # ========================================================
+    # LEG FILTERING
+    # ========================================================
 
-    # ========================================================================
-    # LEG FILTER
-    # ========================================================================
-
-    def filter_legs(
+    def filter_visible_legs(
         self,
-        instances: List[ComponentInstance]
-    ) -> List[ComponentInstance]:
-
-        """
-        Keep visible/detected legs without inventing hidden legs.
-
-        A leg should generally:
-            - be reasonably small
-            - be below the main sofa
-            - have non-zero height
-        """
+        components,
+        image_height,
+    ):
 
         raw_legs = [
-            i
-            for i in instances
-            if i.cls_name == "legs"
-            and i.confidence >= GEOMETRY_CONFIDENCE
-            and i.area_px >= MIN_COMPONENT_AREA
+            component
+            for component in components
+            if (
+                component.cls_name
+                == "legs"
+            )
+            and (
+                component.confidence
+                >= self.geometry_confidence
+            )
+            and (
+                component.area_px
+                >= MIN_COMPONENT_AREA
+            )
         ]
-
-        if not raw_legs:
-
-            return []
-
-        non_legs = [
-            i
-            for i in instances
-            if i.cls_name != "legs"
-        ]
-
-        if not non_legs:
-
-            return raw_legs
-
-        sofa_bottom = max(
-            i.bbox[3]
-            for i in non_legs
-        )
 
         candidates = []
 
         for leg in raw_legs:
 
-            # Leg should normally be near/below sofa bottom.
-            if leg.bbox[1] < sofa_bottom - 20:
-
+            # Legs normally occur in the lower
+            # part of the sofa.
+            if (
+                leg.center_y
+                < image_height * 0.45
+            ):
                 continue
 
-            # Extremely large regions are probably false positives.
+            # Reject extremely wide regions
+            # that are unlikely to be legs.
             if (
-                leg.width_px
-                > 0.25
-                * max(
-                    1,
-                    max(
-                        x.width_px
-                        for x in non_legs
-                    )
+                leg.width
+                > max(
+                    leg.height * 3.0,
+                    30
                 )
             ):
-
                 continue
 
             candidates.append(
                 leg
             )
 
-        # Remove duplicate leg detections.
-        candidates = sorted(
+        final_legs = []
+
+        for leg in sorted(
             candidates,
-            key=lambda x: x.confidence,
-            reverse=True
-        )
-
-        filtered = []
-
-        for candidate in candidates:
+            key=lambda item:
+                item.confidence,
+            reverse=True,
+        ):
 
             duplicate = False
 
-            for existing in filtered:
-
-                center_distance = abs(
-                    candidate.center_x
-                    - existing.center_x
-                )
+            for existing in final_legs:
 
                 if (
-                    self.calculate_iou(
-                        candidate,
+                    self.mask_iou(
+                        leg,
                         existing
-                    ) > 0.2
-                    or center_distance < 8
+                    )
+                    > 0.30
                 ):
 
                     duplicate = True
+
                     break
 
             if not duplicate:
 
-                filtered.append(
-                    candidate
+                final_legs.append(
+                    leg
                 )
 
-        return filtered
+        final_legs.sort(
+            key=lambda item:
+                item.center_x
+        )
 
+        return final_legs
 
-    # ========================================================================
-    # PHYSICAL ARM ASSIGNMENT
-    # ========================================================================
+    # ========================================================
+    # ARM DETECTION
+    # ========================================================
 
-    def assign_physical_arms(
+    def get_arms(
         self,
-        instances: List[ComponentInstance]
-    ) -> Tuple[
-        Optional[ComponentInstance],
-        Optional[ComponentInstance]
-    ]:
+        components
+    ):
 
-        """
-        IMPORTANT:
-
-        Do not trust YOLO left_arm/right_arm class to determine
-        physical image side.
-
-        Smaller X = physical left.
-        Larger X = physical right.
-        """
-
-        arms = [
-            i
-            for i in instances
-            if i.cls_name in (
+        return [
+            component
+            for component in components
+            if component.cls_name
+            in (
                 "left_arm",
-                "right_arm"
+                "right_arm",
             )
-            and i.confidence >= GEOMETRY_CONFIDENCE
-            and i.area_px >= MIN_COMPONENT_AREA
         ]
 
-        if len(arms) < 2:
+    # ========================================================
+    # OVERALL SOFA GEOMETRY
+    # ========================================================
 
-            return None, None
-
-        arms = sorted(
-            arms,
-            key=lambda x: x.center_x
-        )
-
-        return (
-            arms[0],
-            arms[-1]
-        )
-
-
-    # ========================================================================
-    # OVERALL SOFA BOUNDING BOX
-    # ========================================================================
-
-    def calculate_overall_bbox(
+    def calculate_overall_geometry(
         self,
-        instances: List[ComponentInstance]
-    ) -> Optional[
-        Tuple[int, int, int, int]
-    ]:
-
-        useful = [
-            i
-            for i in instances
-            if i.cls_name != "legs"
-        ]
-
-        if not useful:
-
-            useful = instances
-
-        if not useful:
-
-            return None
-
-        x1 = min(
-            i.bbox[0]
-            for i in useful
-        )
-
-        y1 = min(
-            i.bbox[1]
-            for i in useful
-        )
-
-        x2 = max(
-            i.bbox[2]
-            for i in useful
-        )
-
-        y2 = max(
-            i.bbox[3]
-            for i in useful
-        )
-
-        # Include visible legs in height only.
-        legs = [
-            i
-            for i in instances
-            if i.cls_name == "legs"
-        ]
-
-        if legs:
-
-            y2 = max(
-                y2,
-                max(
-                    i.bbox[3]
-                    for i in legs
-                )
-            )
-
-        return (
-            x1,
-            y1,
-            x2,
-            y2
-        )
-
-
-    # ========================================================================
-    # SEAT CUSHION
-    # ========================================================================
-
-    def get_main_seat_cushion(
-        self,
-        instances: List[ComponentInstance]
-    ) -> Optional[ComponentInstance]:
-
-        cushions = [
-            i
-            for i in instances
-            if i.cls_name == "seat_cushion"
-            and i.confidence >= GEOMETRY_CONFIDENCE
-            and i.area_px >= MIN_COMPONENT_AREA
-        ]
-
-        if not cushions:
-
-            return None
-
-        # For continuous cushion sofas, use the largest seat cushion.
-        return max(
-            cushions,
-            key=lambda x: x.area_px
-        )
-
-
-    # ========================================================================
-    # ARM INNER SPAN
-    # ========================================================================
-
-    def calculate_arm_inner_span(
-        self,
-        physical_left: Optional[ComponentInstance],
-        physical_right: Optional[ComponentInstance]
-    ) -> Optional[float]:
-
-        if (
-            physical_left is None
-            or physical_right is None
-        ):
-
-            return None
-
-        left_inner = (
-            physical_left.bbox[2]
-        )
-
-        right_inner = (
-            physical_right.bbox[0]
-        )
-
-        span = (
-            right_inner
-            - left_inner
-        )
-
-        return max(
-            0.0,
-            float(span)
-        )
-
-
-    # ========================================================================
-    # SEATER ESTIMATION
-    # ========================================================================
-
-    def estimate_seater_from_geometry(
-        self,
-        overall_width: float,
-        inner_span: Optional[float],
-        seat: Optional[ComponentInstance],
-        seat_count: int,
-        back_count: int
-    ) -> Tuple[
-        int,
-        float,
-        str,
-        List[str],
-        Dict
-    ]:
-
-        """
-        Main seater classifier.
-
-        IMPORTANT:
-            It does NOT assume:
-                one cushion = one seat.
-
-        Geometry is the main signal.
-        """
-
-        explanation = []
-
-        if overall_width <= 0:
-
-            return (
-                0,
-                0.0,
-                "none",
-                [
-                    "Overall sofa width unavailable."
-                ],
-                {}
-            )
-
-        if seat is None:
-
-            # No seat cushion.
-            # Use inner span if available.
-            if inner_span is not None:
-
-                inner_ratio = (
-                    inner_span /
-                    overall_width
-                )
-
-                if inner_ratio < INNER_SPAN_1_MAX:
-
-                    count = 1
-
-                elif inner_ratio < INNER_SPAN_2_MAX:
-
-                    count = 2
-
-                elif inner_ratio < INNER_SPAN_3_MAX:
-
-                    count = 3
-
-                else:
-
-                    count = 4
-
-                confidence = 0.55
-
-                explanation.append(
-                    "No seat cushion was detected. "
-                    "Seater type estimated from "
-                    "physical arm-to-arm span."
-                )
-
-                return (
-                    count,
-                    confidence,
-                    "arm_inner_span",
-                    explanation,
-                    {
-                        "inner_span_ratio":
-                            inner_ratio
-                    }
-                )
-
-            return (
-                0,
-                0.0,
-                "none",
-                [
-                    "Insufficient geometry for "
-                    "seater classification."
-                ],
-                {}
-            )
-
-        seat_width = float(
-            seat.width_px
-        )
-
-        seat_height = float(
-            seat.height_px
-        )
-
-        seat_ratio = (
-            seat_width /
-            overall_width
-        )
-
-        seat_ar = (
-            seat_width /
-            seat_height
-            if seat_height > 0
-            else 0
-        )
-
-        inner_ratio = None
-        seat_inner_ratio = None
-
-        if inner_span is not None:
-
-            inner_ratio = (
-                inner_span /
-                overall_width
-            )
-
-            if inner_span > 0:
-
-                seat_inner_ratio = (
-                    seat_width /
-                    inner_span
-                )
-
-        explanation.append(
-            f"Main seat cushion width = "
-            f"{seat_width:.1f}px."
-        )
-
-        explanation.append(
-            f"Overall sofa width = "
-            f"{overall_width:.1f}px."
-        )
-
-        explanation.append(
-            f"Seat/overall width ratio = "
-            f"{seat_ratio:.3f}."
-        )
-
-        if inner_span is not None:
-
-            explanation.append(
-                f"Usable arm-to-arm span = "
-                f"{inner_span:.1f}px."
-            )
-
-            explanation.append(
-                f"Inner-span/overall ratio = "
-                f"{inner_ratio:.3f}."
-            )
-
-            explanation.append(
-                f"Seat/inner-span ratio = "
-                f"{seat_inner_ratio:.3f}."
-            )
-
-        explanation.append(
-            f"Seat cushion aspect ratio = "
-            f"{seat_ar:.2f}."
-        )
-
-        # ------------------------------------------------------------------
-        # SIGNAL 1: seat/overall ratio
-        # ------------------------------------------------------------------
-
-        if seat_ratio < SEAT_RATIO_1_MAX:
-
-            ratio_count = 1
-
-        elif seat_ratio < SEAT_RATIO_2_MAX:
-
-            ratio_count = 2
-
-        elif seat_ratio < SEAT_RATIO_3_MAX:
-
-            ratio_count = 3
-
-        else:
-
-            ratio_count = 4
-
-        # ------------------------------------------------------------------
-        # SIGNAL 2: arm inner span
-        # ------------------------------------------------------------------
-
-        if inner_ratio is not None:
-
-            if inner_ratio < INNER_SPAN_1_MAX:
-
-                inner_count = 1
-
-            elif inner_ratio < INNER_SPAN_2_MAX:
-
-                inner_count = 2
-
-            elif inner_ratio < INNER_SPAN_3_MAX:
-
-                inner_count = 3
-
-            else:
-
-                inner_count = 4
-
-        else:
-
-            inner_count = None
-
-        # ------------------------------------------------------------------
-        # SIGNAL 3: cushion aspect ratio
-        # ------------------------------------------------------------------
-
-        if seat_ar < SEAT_AR_2_MIN:
-
-            aspect_count = 1
-
-        elif seat_ar < SEAT_AR_3_MIN:
-
-            aspect_count = 2
-
-        elif seat_ar < SEAT_AR_4_MIN:
-
-            aspect_count = 3
-
-        else:
-
-            aspect_count = 4
-
-        # ------------------------------------------------------------------
-        # Weighted geometry vote
-        # ------------------------------------------------------------------
-
-        votes = []
-
-        # Seat width ratio is strongest.
-        votes.append(
-            (
-                ratio_count,
-                0.50
-            )
-        )
-
-        # Arm span is second strongest.
-        if inner_count is not None:
-
-            votes.append(
-                (
-                    inner_count,
-                    0.30
-                )
-            )
-
-        # Aspect ratio is supporting evidence.
-        votes.append(
-            (
-                aspect_count,
-                0.20
-            )
-        )
-
-        scores = {
-            1: 0.0,
-            2: 0.0,
-            3: 0.0,
-            4: 0.0
-        }
-
-        for count, weight in votes:
-
-            scores[count] += weight
-
-        predicted = max(
-            scores,
-            key=scores.get
-        )
-
-        score = scores[
-            predicted
-        ]
-
-        # ------------------------------------------------------------------
-        # Continuous cushion correction
-        # ------------------------------------------------------------------
-
-        if seat_count == 1:
-
-            explanation.append(
-                "Only one continuous seat cushion "
-                "was detected."
-            )
-
-            explanation.append(
-                "The cushion count is NOT interpreted "
-                "as the final seat count."
-            )
-
-        # ------------------------------------------------------------------
-        # Important correction for 2-seater geometry
-        # ------------------------------------------------------------------
-
-        # If the geometry strongly supports 2 seats,
-        # do not allow one-cushion counting to reduce it to 1.
-        if (
-            predicted == 1
-            and ratio_count == 2
-        ):
-
-            predicted = 2
-            score = max(
-                score,
-                0.70
-            )
-
-            explanation.append(
-                "Continuous-cushion correction: "
-                "geometry supports 2 seats even "
-                "though only one seat-cushion "
-                "instance was detected."
-            )
-
-        # ------------------------------------------------------------------
-        # Additional consistency rules
-        # ------------------------------------------------------------------
-
-        if (
-            predicted == 1
-            and seat_ar >= SEAT_AR_2_MIN
-            and seat_ratio >= 0.55
-        ):
-
-            predicted = 2
-
-            score = max(
-                score,
-                0.65
-            )
-
-            explanation.append(
-                "Seat cushion is too wide to be "
-                "treated as a single seating position."
-            )
-
-        if (
-            predicted == 4
-            and seat_ratio < 0.86
-        ):
-
-            # Prevent an overly aggressive 4-seat result
-            # from a wide but normal 2/3-seater cushion.
-            predicted = 3
-
-            score = max(
-                score,
-                0.65
-            )
-
-            explanation.append(
-                "4-seat estimate was reduced because "
-                "the seat/overall width ratio does "
-                "not strongly support four seats."
-            )
-
-        # ------------------------------------------------------------------
-        # Confidence
-        # ------------------------------------------------------------------
-
-        # Agreement increases confidence.
-        signal_counts = [
-            ratio_count,
-            aspect_count
-        ]
-
-        if inner_count is not None:
-
-            signal_counts.append(
-                inner_count
-            )
-
-        agreement = (
-            signal_counts.count(
-                predicted
-            )
-            /
-            len(signal_counts)
-        )
-
-        confidence = (
-            0.55
-            +
-            0.40 * agreement
-        )
-
-        confidence = min(
-            confidence,
-            0.95
-        )
-
-        # If exactly one cushion is detected,
-        # reduce confidence slightly because the model
-        # does not directly observe individual seats.
-        if seat_count == 1:
-
-            confidence -= 0.05
-
-        confidence = max(
-            0.50,
-            confidence
-        )
-
-        explanation.append(
-            f"Geometry vote = "
-            f"{predicted}-seater."
-        )
-
-        explanation.append(
-            f"Geometry confidence = "
-            f"{confidence * 100:.1f}%."
-        )
-
-        diagnostics = {
-
-            "ratio_count":
-                ratio_count,
-
-            "inner_span_count":
-                inner_count,
-
-            "aspect_count":
-                aspect_count,
-
-            "scores":
-                scores,
-
-            "seat_ratio":
-                seat_ratio,
-
-            "inner_ratio":
-                inner_ratio,
-
-            "seat_inner_ratio":
-                seat_inner_ratio,
-
-            "seat_aspect_ratio":
-                seat_ar
-        }
-
-        return (
-            predicted,
-            confidence,
-            "geometry",
-            explanation,
-            diagnostics
-        )
-
-
-    # ========================================================================
-    # SHAPE CLASSIFICATION
-    # ========================================================================
-
-    def classify_shape(
-        self,
-        instances: List[ComponentInstance]
-    ) -> Tuple[
-        str,
-        float,
-        bool
-    ]:
+        components,
+    ):
 
         structural = [
-            i
-            for i in instances
-            if i.cls_name in (
+            component
+            for component in components
+            if component.cls_name
+            in (
+                "back_cushion",
                 "base",
                 "left_arm",
-                "right_arm"
+                "right_arm",
+                "legs",
             )
         ]
 
         if not structural:
 
             return (
-                "unknown",
                 0.0,
-                False
-            )
-
-        combined = np.zeros_like(
-            structural[0].mask,
-            dtype=np.uint8
-        )
-
-        for instance in structural:
-
-            combined = np.logical_or(
-                combined,
-                instance.mask
-            ).astype(
-                np.uint8
-            )
-
-        contours, _ = cv2.findContours(
-            combined,
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE
-        )
-
-        if not contours:
-
-            return (
-                "unknown",
                 0.0,
-                False
+                0.0,
             )
 
-        largest = max(
-            contours,
-            key=cv2.contourArea
-        )
+        non_leg_components = [
+            component
+            for component in structural
+            if component.cls_name
+            != "legs"
+        ]
 
-        area = cv2.contourArea(
-            largest
-        )
+        if non_leg_components:
 
-        hull = cv2.convexHull(
-            largest
-        )
-
-        hull_area = cv2.contourArea(
-            hull
-        )
-
-        if hull_area <= 0:
-
-            solidity = 1.0
+            top_y = min(
+                component.y1
+                for component
+                in non_leg_components
+            )
 
         else:
 
-            solidity = (
-                area /
-                hull_area
+            top_y = min(
+                component.y1
+                for component
+                in structural
             )
 
-        if solidity > 0.90:
-
-            return (
-                "straight",
-                round(
-                    float(solidity),
-                    3
-                ),
-                False
-            )
-
-        if solidity > 0.75:
-
-            return (
-                "chaise / extended",
-                round(
-                    float(solidity),
-                    3
-                ),
-                True
-            )
-
-        return (
-            "L-shaped / sectional",
-            round(
-                float(solidity),
-                3
-            ),
-            True
+        left_x = min(
+            component.x1
+            for component
+            in structural
         )
 
+        right_x = max(
+            component.x2
+            for component
+            in structural
+        )
 
-    # ========================================================================
-    # VISUALIZATION
-    # ========================================================================
+        bottom_y = max(
+            component.y2
+            for component
+            in structural
+        )
 
-    def create_visualization(
+        width = float(
+            right_x - left_x
+        )
+
+        height = float(
+            bottom_y - top_y
+        )
+
+        aspect_ratio = (
+            width / height
+            if height > 0
+            else 0.0
+        )
+
+        return (
+            width,
+            height,
+            aspect_ratio,
+        )
+
+    # ========================================================
+    # SEAT GEOMETRY FROM MASKS
+    # ========================================================
+
+    def calculate_seat_geometry(
         self,
-        image_path: str,
-        instances: List[ComponentInstance],
-        physical_left: Optional[ComponentInstance],
-        physical_right: Optional[ComponentInstance],
-        legs: List[ComponentInstance],
-        report: SofaGeometryReport
-    ) -> str:
+        components,
+    ):
+
+        cushions = [
+            component
+            for component in components
+            if (
+                component.cls_name
+                == "seat_cushion"
+            )
+        ]
+
+        if not cushions:
+
+            return {
+                "count": 0,
+                "width": 0.0,
+                "height": 0.0,
+                "aspect_ratio": 0.0,
+                "area": 0.0,
+                "mask": None,
+            }
+
+        combined_mask = np.zeros_like(
+            cushions[0].mask
+        )
+
+        for cushion in cushions:
+
+            combined_mask = cv2.bitwise_or(
+                combined_mask,
+                cushion.mask,
+            )
+
+        ys, xs = np.where(
+            combined_mask > 0
+        )
+
+        if len(xs) == 0:
+
+            return {
+                "count": len(cushions),
+                "width": 0.0,
+                "height": 0.0,
+                "aspect_ratio": 0.0,
+                "area": 0.0,
+                "mask": combined_mask,
+            }
+
+        mask_x1 = int(
+            xs.min()
+        )
+
+        mask_x2 = int(
+            xs.max()
+        )
+
+        mask_y1 = int(
+            ys.min()
+        )
+
+        mask_y2 = int(
+            ys.max()
+        )
+
+        width = float(
+            mask_x2 - mask_x1 + 1
+        )
+
+        height = float(
+            mask_y2 - mask_y1 + 1
+        )
+
+        aspect_ratio = (
+            width / height
+            if height > 0
+            else 0.0
+        )
+
+        area = float(
+            cv2.countNonZero(
+                combined_mask
+            )
+        )
+
+        return {
+            "count": len(cushions),
+            "width": width,
+            "height": height,
+            "aspect_ratio": aspect_ratio,
+            "area": area,
+            "mask": combined_mask,
+        }
+
+    # ========================================================
+    # ARM INNER SPAN
+    # ========================================================
+
+    def calculate_inner_seating_span(
+        self,
+        components,
+        overall_width,
+    ):
+
+        arms = self.get_arms(
+            components
+        )
+
+        if len(arms) < 2:
+
+            return (
+                None,
+                None,
+                None,
+            )
+
+        arms_sorted = sorted(
+            arms,
+            key=lambda item:
+                item.center_x
+        )
+
+        left_arm = arms_sorted[0]
+        right_arm = arms_sorted[-1]
+
+        left_inner_x = left_arm.x2
+        right_inner_x = right_arm.x1
+
+        inner_span = max(
+            0,
+            right_inner_x
+            - left_inner_x
+        )
+
+        return (
+            float(inner_span),
+            left_arm,
+            right_arm,
+        )
+
+    # ========================================================
+    # SEATER CLASSIFICATION
+    # ========================================================
+
+    def classify_seater(
+        self,
+        components,
+        overall_width,
+        overall_height,
+    ):
+
+        seat_geometry = (
+            self.calculate_seat_geometry(
+                components
+            )
+        )
+
+        seat_count = (
+            seat_geometry["count"]
+        )
+
+        seat_width = (
+            seat_geometry["width"]
+        )
+
+        seat_height = (
+            seat_geometry["height"]
+        )
+
+        seat_aspect = (
+            seat_geometry["aspect_ratio"]
+        )
+
+        # ----------------------------------------------------
+        # Sofa aspect ratio
+        # ----------------------------------------------------
+
+        sofa_aspect = (
+            overall_width
+            / overall_height
+            if overall_height > 0
+            else 0.0
+        )
+
+        # ----------------------------------------------------
+        # No seat cushion
+        # ----------------------------------------------------
+
+        if seat_count == 0:
+
+            back_count = len([
+                component
+                for component in components
+                if component.cls_name
+                == "back_cushion"
+            ])
+
+            if 1 <= back_count <= 4:
+
+                return (
+                    back_count,
+                    0.55,
+                    "back cushion count",
+                )
+
+            return (
+                0,
+                0.0,
+                "insufficient seat geometry",
+            )
+
+        # ----------------------------------------------------
+        # Multiple separate seat cushions
+        # ----------------------------------------------------
+
+        if seat_count >= 2:
+
+            final_count = min(
+                seat_count,
+                4,
+            )
+
+            confidence = 0.90
+
+            return (
+                final_count,
+                confidence,
+                "multiple seat cushions",
+            )
+
+        # ----------------------------------------------------
+        # ONE CONTINUOUS CUSHION
+        # ----------------------------------------------------
+        #
+        # One continuous cushion can represent
+        # multiple seats.
+        #
+        # We therefore use:
+        #
+        #   seat width / overall sofa width
+        #   sofa aspect ratio
+        #   seat aspect ratio
+        #   arm-to-arm span
+        #
+        # together.
+        # ----------------------------------------------------
+
+        seat_to_sofa_ratio = (
+            seat_width
+            / overall_width
+            if overall_width > 0
+            else 0.0
+        )
+
+        inner_span, left_arm, right_arm = (
+            self.calculate_inner_seating_span(
+                components,
+                overall_width,
+            )
+        )
+
+        # ----------------------------------------------------
+        # If both arms exist, calculate the seat coverage
+        # inside the arms.
+        # ----------------------------------------------------
+
+        inner_ratio = 0.0
+
+        if (
+            inner_span is not None
+            and inner_span > 0
+        ):
+
+            inner_ratio = (
+                seat_width
+                / inner_span
+            )
+
+        # ----------------------------------------------------
+        # Main classification
+        # ----------------------------------------------------
+
+        if seat_to_sofa_ratio < 0.42:
+
+            count = 1
+
+        elif seat_to_sofa_ratio < 0.62:
+
+            count = 2
+
+        elif seat_to_sofa_ratio < 0.80:
+
+            # This is the important range for
+            # normal 2/3 seat sofas.
+            #
+            # Use sofa proportions as secondary
+            # evidence.
+
+            if (
+                sofa_aspect >= 2.75
+                and seat_aspect >= 4.0
+            ):
+
+                count = 3
+
+            else:
+
+                count = 2
+
+        else:
+
+            # Very wide continuous cushion.
+
+            if (
+                sofa_aspect >= 2.90
+                and seat_aspect >= 4.0
+            ):
+
+                count = 3
+
+            else:
+
+                count = 4
+
+        # ----------------------------------------------------
+        # Inner span refinement
+        # ----------------------------------------------------
+
+        if inner_span is not None:
+
+            # If cushion fills almost all of the
+            # usable span, do not automatically call
+            # it a 4-seater.
+            if (
+                1.05
+                <= inner_ratio
+                <= 1.55
+            ):
+
+                if count > 3:
+
+                    count = 3
+
+            # Narrow usable span strongly supports
+            # 2 seats.
+            if (
+                inner_span
+                < overall_width * 0.55
+            ):
+
+                count = min(
+                    count,
+                    2,
+                )
+
+        # ----------------------------------------------------
+        # Seat aspect ratio refinement
+        # ----------------------------------------------------
+
+        if seat_aspect < 2.30:
+
+            count = min(
+                count,
+                2,
+            )
+
+        # ----------------------------------------------------
+        # Very long sofa
+        # ----------------------------------------------------
+
+        if (
+            sofa_aspect >= 3.30
+            and seat_aspect >= 4.0
+        ):
+
+            count = max(
+                count,
+                3,
+            )
+
+        # ----------------------------------------------------
+        # Confidence
+        # ----------------------------------------------------
+
+        confidence = 0.82
+
+        if (
+            0.55
+            <= seat_to_sofa_ratio
+            <= 0.78
+        ):
+
+            confidence += 0.06
+
+        if (
+            seat_aspect >= 3.5
+        ):
+
+            confidence += 0.03
+
+        if (
+            inner_span is not None
+        ):
+
+            confidence += 0.03
+
+        confidence = min(
+            confidence,
+            0.95,
+        )
+
+        return (
+            count,
+            confidence,
+            "continuous seat-cushion segmentation geometry",
+        )
+
+    # ========================================================
+    # REPORT CREATION
+    # ========================================================
+
+    def create_report(
+        self,
+        components,
+        visible_legs,
+        overall_width,
+        overall_height,
+        overall_aspect,
+        seat_geometry,
+        sofa_type,
+        seat_count,
+        confidence,
+        method,
+    ):
+
+        seat_width = (
+            seat_geometry["width"]
+        )
+
+        seat_height = (
+            seat_geometry["height"]
+        )
+
+        seat_aspect = (
+            seat_geometry["aspect_ratio"]
+        )
+
+        seat_to_sofa_ratio = (
+            seat_width / overall_width
+            if overall_width > 0
+            else 0.0
+        )
+
+        arms = self.get_arms(
+            components
+        )
+
+        report_components = []
+
+        for component in components:
+
+            report_components.append(
+                {
+                    "class": component.cls_name,
+                    "confidence": round(
+                        component.confidence,
+                        4,
+                    ),
+                    "area_px": round(
+                        component.area_px,
+                        2,
+                    ),
+                    "bbox": [
+                        component.x1,
+                        component.y1,
+                        component.x2,
+                        component.y2,
+                    ],
+                }
+            )
+
+        return {
+            "sofa_type": sofa_type,
+            "seat_count": seat_count,
+            "confidence": round(
+                confidence,
+                4,
+            ),
+            "classification_method": method,
+
+            "seat_cushion_count": (
+                seat_geometry["count"]
+            ),
+
+            "visible_leg_count": len(
+                visible_legs
+            ),
+
+            "overall_width_px": round(
+                overall_width,
+                2,
+            ),
+
+            "overall_height_px": round(
+                overall_height,
+                2,
+            ),
+
+            "overall_aspect_ratio": round(
+                overall_aspect,
+                4,
+            ),
+
+            "seat_width_px": round(
+                seat_width,
+                2,
+            ),
+
+            "seat_height_px": round(
+                seat_height,
+                2,
+            ),
+
+            "seat_aspect_ratio": round(
+                seat_aspect,
+                4,
+            ),
+
+            "seat_to_sofa_width_ratio": round(
+                seat_to_sofa_ratio,
+                4,
+            ),
+
+            "arm_count": len(
+                arms
+            ),
+
+            "components": report_components,
+        }
+
+
+    # ========================================================
+    # FINAL COMBINED VISUALIZATION
+    # ========================================================
+
+    def create_final_visualization(
+        self,
+        original_image,
+        all_components,
+        geometry_components,
+        report,
+        output_path,
+    ):
+        """
+        Create ONE final PNG containing:
+
+        - Transparent background outside the sofa
+        - Sofa segmentation
+        - Geometry-valid component outlines
+        - Original YOLO class names
+        - Component confidence labels
+        - Sofa type
+        - Sofa confidence
+
+        No bounding boxes.
+        No physical left/right reassignment.
+        """
+
+        height, width = original_image.shape[:2]
+
+        # ----------------------------------------------------
+        # 1. Build foreground mask for background removal.
+        # ----------------------------------------------------
+        foreground = np.zeros(
+            (height, width),
+            dtype=np.uint8,
+        )
+
+        for component in all_components:
+            if component.confidence < self.prediction_confidence:
+                continue
+
+            if component.mask is None:
+                continue
+
+            foreground = cv2.bitwise_or(
+                foreground,
+                component.mask,
+            )
+
+        # Clean small holes/noise without destroying thin sofa parts.
+        kernel = np.ones((5, 5), np.uint8)
+
+        foreground = cv2.morphologyEx(
+            foreground,
+            cv2.MORPH_CLOSE,
+            kernel,
+            iterations=1,
+        )
+
+        foreground = cv2.morphologyEx(
+            foreground,
+            cv2.MORPH_OPEN,
+            kernel,
+            iterations=1,
+        )
+
+        # ----------------------------------------------------
+        # 2. Create transparent RGBA image.
+        # ----------------------------------------------------
+        image = cv2.cvtColor(
+            original_image,
+            cv2.COLOR_BGR2BGRA,
+        )
+
+        # Everything outside detected sofa masks becomes
+        # transparent.
+        image[:, :, 3] = foreground
+
+        # ----------------------------------------------------
+        # 3. Draw geometry-valid segmentation outlines.
+        # ----------------------------------------------------
+        for component in geometry_components:
+            if component.confidence < self.geometry_confidence:
+                continue
+
+            if component.mask is None:
+                continue
+
+            contours, _ = cv2.findContours(
+                component.mask,
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE,
+            )
+
+            # White contour.
+            cv2.drawContours(
+                image,
+                contours,
+                -1,
+                (255, 255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+        # ----------------------------------------------------
+        # 4. Top information panel.
+        #
+        # The panel is intentionally opaque so the sofa type
+        # and confidence remain visible even after background
+        # removal.
+        # ----------------------------------------------------
+        panel_height = 85
+
+        panel = image.copy()
+
+        cv2.rectangle(
+            panel,
+            (0, 0),
+            (width, panel_height),
+            (0, 0, 0, 220),
+            -1,
+        )
+
+        image = cv2.addWeighted(
+            panel,
+            0.72,
+            image,
+            0.28,
+            0,
+        )
+
+        # Make the top panel fully visible.
+        image[:panel_height, :, 3] = 255
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+
+        sofa_text = (
+            f"SOFA TYPE: {report['sofa_type']}"
+        )
+
+        confidence_text = (
+            f"CONFIDENCE: "
+            f"{report['confidence'] * 100:.1f}%"
+        )
+
+        cv2.putText(
+            image,
+            sofa_text,
+            (12, 32),
+            font,
+            0.75,
+            (255, 255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        cv2.putText(
+            image,
+            confidence_text,
+            (12, 66),
+            font,
+            0.62,
+            (255, 255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        # ----------------------------------------------------
+        # 5. Component labels.
+        #
+        # IMPORTANT:
+        # Original YOLO names are preserved exactly.
+        #
+        # No:
+        #   PHYSICAL LEFT ARM
+        #   PHYSICAL RIGHT ARM
+        #
+        # No bounding boxes are drawn.
+        # ----------------------------------------------------
+        used_positions = []
+
+        for component in sorted(
+            geometry_components,
+            key=lambda item: (item.y1, item.x1),
+        ):
+            if component.confidence < self.geometry_confidence:
+                continue
+
+            label = (
+                f"{component.cls_name} "
+                f"{component.confidence:.2f}"
+            )
+
+            text_size, baseline = cv2.getTextSize(
+                label,
+                font,
+                0.45,
+                1,
+            )
+
+            text_width = text_size[0]
+            text_height = text_size[1]
+
+            x = max(
+                5,
+                min(
+                    component.x1,
+                    width - text_width - 12,
+                ),
+            )
+
+            y = max(
+                panel_height + text_height + 8,
+                component.y1,
+            )
+
+            # Try to avoid stacking labels on exactly the same
+            # position.
+            original_y = y
+
+            while any(
+                abs(y - previous_y) < 22
+                and abs(x - previous_x) < 160
+                for previous_x, previous_y in used_positions
+            ):
+                y += 22
+
+                if y >= height - 5:
+                    y = original_y
+                    break
+
+            used_positions.append((x, y))
+
+            # Black label background.
+            cv2.rectangle(
+                image,
+                (
+                    int(x),
+                    int(y - text_height - 5),
+                ),
+                (
+                    int(
+                        min(
+                            width - 1,
+                            x + text_width + 8,
+                        )
+                    ),
+                    int(
+                        min(
+                            height - 1,
+                            y + baseline + 2,
+                        )
+                    ),
+                ),
+                (0, 0, 0, 230),
+                -1,
+            )
+
+            # White text.
+            cv2.putText(
+                image,
+                label,
+                (
+                    int(x + 4),
+                    int(y),
+                ),
+                font,
+                0.45,
+                (255, 255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+        # ----------------------------------------------------
+        # 6. Keep labels/panel visible.
+        #
+        # Labels are placed on/near detected sofa regions.
+        # The label background is made opaque so the text does
+        # not disappear when the image is viewed over a white
+        # or checkerboard transparency background.
+        # ----------------------------------------------------
+
+        # ----------------------------------------------------
+        # 7. Save ONE final PNG.
+        # ----------------------------------------------------
+        os.makedirs(
+            os.path.dirname(output_path),
+            exist_ok=True,
+        )
+
+        success = cv2.imwrite(
+            output_path,
+            image,
+        )
+
+        if not success:
+            raise IOError(
+                f"Could not save final visualization:\n"
+                f"{output_path}"
+            )
+
+        print(
+            f"\nCombined final image saved to:\n"
+            f"{os.path.abspath(output_path)}"
+        )
+
+        return output_path
+
+
+    # ========================================================
+    # TEXT REPORT
+    # ========================================================
+
+    def create_text_report(
+        self,
+        report,
+        components,
+        visible_legs,
+    ):
+
+        lines = []
+
+        lines.append(
+            "=" * 70
+        )
+
+        lines.append(
+            "SOFA GEOMETRY ANALYSIS"
+        )
+
+        lines.append(
+            "=" * 70
+        )
+
+        lines.append("")
+
+        lines.append(
+            f"SOFA TYPE: {report['sofa_type']}"
+        )
+
+        lines.append(
+            f"CONFIDENCE: "
+            f"{report['confidence'] * 100:.1f}%"
+        )
+
+        lines.append("")
+
+        lines.append(
+            "COMPONENT DETECTIONS"
+        )
+
+        lines.append(
+            "-" * 70
+        )
+
+        for component in components:
+
+            lines.append(
+                f"{component.cls_name:15s} "
+                f"confidence="
+                f"{component.confidence:.3f} "
+                f"area="
+                f"{component.area_px:.1f}px2"
+            )
+
+        lines.append("")
+
+        lines.append(
+            "GEOMETRY"
+        )
+
+        lines.append(
+            "-" * 70
+        )
+
+        lines.append(
+            f"Overall width: "
+            f"{report['overall_width_px']:.2f}px"
+        )
+
+        lines.append(
+            f"Overall height: "
+            f"{report['overall_height_px']:.2f}px"
+        )
+
+        lines.append(
+            f"Overall aspect ratio: "
+            f"{report['overall_aspect_ratio']:.4f}"
+        )
+
+        lines.append("")
+
+        lines.append(
+            f"Seat cushions: "
+            f"{report['seat_cushion_count']}"
+        )
+
+        lines.append(
+            f"Visible legs: "
+            f"{report['visible_leg_count']}"
+        )
+
+        lines.append(
+            f"Seat width: "
+            f"{report['seat_width_px']:.2f}px"
+        )
+
+        lines.append(
+            f"Seat height: "
+            f"{report['seat_height_px']:.2f}px"
+        )
+
+        lines.append(
+            f"Seat aspect ratio: "
+            f"{report['seat_aspect_ratio']:.4f}"
+        )
+
+        lines.append(
+            f"Seat / sofa width ratio: "
+            f"{report['seat_to_sofa_width_ratio']:.4f}"
+        )
+
+        lines.append("")
+
+        lines.append(
+            f"Classification method: "
+            f"{report['classification_method']}"
+        )
+
+        lines.append("")
+
+        lines.append(
+            "=" * 70
+        )
+
+        return "\n".join(
+            lines
+        )
+
+    # ========================================================
+    # COMPLETE ANALYSIS
+    # ========================================================
+
+    def analyze(
+        self,
+        image_path,
+    ):
+
+        print()
+        print("=" * 70)
+        print("SOFA GEOMETRY ANALYSIS")
+        print("=" * 70)
+
+        print(
+            f"Input image:\n{image_path}"
+        )
+
+        # ----------------------------------------------------
+        # Create output directory
+        # ----------------------------------------------------
+
+        os.makedirs(
+            OUTPUT_DIR,
+            exist_ok=True,
+        )
+
+        # ----------------------------------------------------
+        # Load image
+        # ----------------------------------------------------
 
         image = cv2.imread(
             image_path
@@ -1677,1173 +1678,434 @@ class SofaGeometryAnalyzer:
         if image is None:
 
             raise ValueError(
-                f"Could not read image: "
+                f"Could not read image:\n"
                 f"{image_path}"
             )
 
-        # ---------------------------------------------------------------
-        # Draw component masks / boxes
-        # ---------------------------------------------------------------
-
-        for instance in instances:
-
-            # Only visualize geometry-valid components.
-            if (
-                instance.confidence
-                < GEOMETRY_CONFIDENCE
-            ):
-                continue
-
-            if (
-                instance.area_px
-                < MIN_COMPONENT_AREA
-            ):
-                continue
-
-            color = (
-                255,
-                0,
-                0
-            )
-
-            if instance.cls_name == "seat_cushion":
-
-                color = (
-                    0,
-                    165,
-                    255
-                )
-
-            elif instance.cls_name == "back_cushion":
-
-                color = (
-                    255,
-                    0,
-                    0
-                )
-
-            elif instance.cls_name == "base":
-
-                color = (
-                    0,
-                    255,
-                    0
-                )
-
-            elif instance.cls_name in (
-                "left_arm",
-                "right_arm"
-            ):
-
-                color = (
-                    255,
-                    0,
-                    255
-                )
-
-            elif instance.cls_name == "legs":
-
-                color = (
-                    0,
-                    255,
-                    255
-                )
-
-            # Contour.
-            contours, _ = cv2.findContours(
-                instance.mask.astype(
-                    np.uint8
-                ),
-                cv2.RETR_EXTERNAL,
-                cv2.CHAIN_APPROX_SIMPLE
-            )
-
-            cv2.drawContours(
-                image,
-                contours,
-                -1,
-                color,
-                2
-            )
-
-            x1, y1, x2, y2 = (
-                instance.bbox
-            )
-
-            cv2.rectangle(
-                image,
-                (x1, y1),
-                (x2, y2),
-                color,
-                1
-            )
-
-            label = (
-                f"{instance.cls_name} "
-                f"{instance.confidence:.2f}"
-            )
-
-            cv2.putText(
-                image,
-                label,
-                (
-                    x1,
-                    max(
-                        15,
-                        y1 - 5
-                    )
-                ),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                color,
-                1,
-                cv2.LINE_AA
-            )
-
-        # ---------------------------------------------------------------
-        # Physical arm labels
-        # ---------------------------------------------------------------
-
-        if physical_left is not None:
-
-            x = int(
-                physical_left.center_x
-            )
-
-            y = max(
-                20,
-                int(
-                    physical_left.bbox[1]
-                    - 20
-                )
-            )
-
-            cv2.putText(
-                image,
-                "PHYSICAL LEFT ARM",
-                (x, y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (255, 0, 255),
-                2,
-                cv2.LINE_AA
-            )
-
-        if physical_right is not None:
-
-            x = int(
-                physical_right.center_x
-            )
-
-            y = max(
-                20,
-                int(
-                    physical_right.bbox[1]
-                    - 20
-                )
-            )
-
-            cv2.putText(
-                image,
-                "PHYSICAL RIGHT ARM",
-                (x, y),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (255, 0, 255),
-                2,
-                cv2.LINE_AA
-            )
-
-        # ---------------------------------------------------------------
-        # Top result panel
-        # ---------------------------------------------------------------
-
-        panel_height = 115
-
-        overlay = image.copy()
-
-        cv2.rectangle(
-            overlay,
-            (0, 0),
-            (
-                image.shape[1],
-                panel_height
-            ),
-            (0, 0, 0),
-            -1
+        image_height, image_width = (
+            image.shape[:2]
         )
 
-        image = cv2.addWeighted(
-            overlay,
-            0.70,
-            image,
-            0.30,
-            0
+        print(
+            f"\nImage width: "
+            f"{image_width} px"
         )
 
-        cv2.putText(
-            image,
-            f"SOFA TYPE: {report.seater_type}",
-            (10, 28),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.75,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA
+        print(
+            f"Image height: "
+            f"{image_height} px"
         )
 
-        cv2.putText(
-            image,
-            f"CONFIDENCE: "
-            f"{report.seater_confidence * 100:.1f}%",
-            (10, 58),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.60,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA
+        # ----------------------------------------------------
+        # YOLO
+        # ----------------------------------------------------
+
+        print()
+        print(
+            "[1/4] Running YOLO segmentation..."
         )
 
-        cv2.putText(
-            image,
-            f"SEAT CUSHIONS: "
-            f"{report.seat_cushion_count}",
-            (10, 85),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA
-        )
-
-        cv2.putText(
-            image,
-            f"VISIBLE LEGS: "
-            f"{report.visible_leg_count}",
-            (10, 108),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.50,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA
-        )
-
-        # ---------------------------------------------------------------
-        # Geometry measurements
-        # ---------------------------------------------------------------
-
-        if (
-            physical_left is not None
-            and physical_right is not None
-        ):
-
-            left_inner = (
-                physical_left.bbox[2]
-            )
-
-            right_inner = (
-                physical_right.bbox[0]
-            )
-
-            y = int(
-                max(
-                    physical_left.bbox[3],
-                    physical_right.bbox[3]
-                )
-                + 15
-            )
-
-            y = min(
-                y,
-                image.shape[0] - 10
-            )
-
-            cv2.line(
-                image,
-                (
-                    left_inner,
-                    y
-                ),
-                (
-                    right_inner,
-                    y
-                ),
-                (255, 255, 255),
-                2
-            )
-
-            cv2.putText(
-                image,
-                "USABLE SEATING SPAN",
-                (
-                    left_inner,
-                    max(
-                        15,
-                        y - 5
-                    )
-                ),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (255, 255, 255),
-                1,
-                cv2.LINE_AA
-            )
-
-        # ---------------------------------------------------------------
-        # Save
-        # ---------------------------------------------------------------
-
-        os.makedirs(
-            OUTPUT_DIR,
-            exist_ok=True
-        )
-
-        output_path = os.path.join(
-            OUTPUT_DIR,
-            "geometry_result.jpg"
-        )
-
-        cv2.imwrite(
-            output_path,
-            image
-        )
-
-        return os.path.abspath(
-            output_path
-        )
-
-
-    # ========================================================================
-    # ANALYSIS
-    # ========================================================================
-
-    def analyze(
-        self,
-        image_path: str,
-        remove_bg: bool = True,
-        verbose: bool = True
-    ) -> Tuple[
-        SofaGeometryReport,
-        List[ComponentInstance],
-        Optional[ComponentInstance],
-        Optional[ComponentInstance],
-        List[ComponentInstance],
-        str
-    ]:
-
-        start_total = time.time()
-
-        # ---------------------------------------------------------------
-        # Background removal
-        # ---------------------------------------------------------------
-
-        if verbose:
-
-            print(
-                "\n[1/5] Background processing..."
-            )
-
-        processed_path = image_path
-
-        temp_created = False
-
-        if remove_bg:
-
-            processed_path = (
-                self.remove_background(
-                    image_path
-                )
-            )
-
-            temp_created = (
-                processed_path
-                != image_path
-            )
-
-        background_output = (
-            self.save_background_removed_image(
-                processed_path,
+        original_image, raw_components = (
+            self.run_inference(
                 image_path
             )
         )
 
-        # ---------------------------------------------------------------
-        # YOLO
-        # ---------------------------------------------------------------
-
-        if verbose:
-
-            print(
-                "[2/5] Running YOLO segmentation..."
-            )
-
-        instances = self.run_inference(
-            processed_path
-        )
-
-        if verbose:
-
-            print(
-                f"      Raw detections: "
-                f"{len(instances)}"
-            )
-
-        # ---------------------------------------------------------------
-        # Cleanup temporary file
-        # ---------------------------------------------------------------
-
-        if (
-            temp_created
-            and os.path.exists(
-                processed_path
-            )
-        ):
-
-            try:
-
-                os.remove(
-                    processed_path
-                )
-
-            except Exception:
-
-                pass
-
-        # ---------------------------------------------------------------
-        # Deduplication
-        # ---------------------------------------------------------------
-
-        if verbose:
-
-            print(
-                "[3/5] Removing duplicate detections..."
-            )
-
-        instances = (
-            self.deduplicate_instances(
-                instances
-            )
-        )
-
-        # ---------------------------------------------------------------
-        # Geometry valid
-        # ---------------------------------------------------------------
-
-        geometry_instances = (
-            self.geometry_valid_components(
-                instances
-            )
-        )
-
-        if verbose:
-
-            print(
-                f"      Geometry-valid detections: "
-                f"{len(geometry_instances)}"
-            )
-
-        # ---------------------------------------------------------------
-        # Arms
-        # ---------------------------------------------------------------
-
-        physical_left, physical_right = (
-            self.assign_physical_arms(
-                geometry_instances
-            )
-        )
-
-        # ---------------------------------------------------------------
-        # Legs
-        # ---------------------------------------------------------------
-
-        visible_legs = (
-            self.filter_legs(
-                geometry_instances
-            )
-        )
-
-        # ---------------------------------------------------------------
-        # Overall bbox
-        # ---------------------------------------------------------------
-
-        overall_bbox = (
-            self.calculate_overall_bbox(
-                geometry_instances
-            )
-        )
-
-        if overall_bbox is None:
+        if original_image is None:
 
             raise RuntimeError(
-                "Could not determine sofa geometry."
-            )
-
-        ox1, oy1, ox2, oy2 = (
-            overall_bbox
-        )
-
-        overall_width = float(
-            ox2 - ox1
-        )
-
-        overall_height = float(
-            oy2 - oy1
-        )
-
-        # ---------------------------------------------------------------
-        # Seat
-        # ---------------------------------------------------------------
-
-        main_seat = (
-            self.get_main_seat_cushion(
-                geometry_instances
-            )
-        )
-
-        seat_cushions = [
-            i
-            for i in geometry_instances
-            if i.cls_name == "seat_cushion"
-        ]
-
-        back_cushions = [
-            i
-            for i in geometry_instances
-            if i.cls_name == "back_cushion"
-        ]
-
-        # ---------------------------------------------------------------
-        # Arm inner span
-        # ---------------------------------------------------------------
-
-        inner_span = (
-            self.calculate_arm_inner_span(
-                physical_left,
-                physical_right
-            )
-        )
-
-        # ---------------------------------------------------------------
-        # Seater classification
-        # ---------------------------------------------------------------
-
-        if verbose:
-
-            print(
-                "[4/5] Calculating seater geometry..."
-            )
-
-        (
-            seat_count,
-            seater_confidence,
-            chosen_source,
-            seater_explanation,
-            diagnostics
-        ) = self.estimate_seater_from_geometry(
-
-            overall_width=overall_width,
-
-            inner_span=inner_span,
-
-            seat=main_seat,
-
-            seat_count=len(
-                seat_cushions
-            ),
-
-            back_count=len(
-                back_cushions
-            )
-        )
-
-        seater_names = {
-            1: "1-seater",
-            2: "2-seater",
-            3: "3-seater",
-            4: "4-seater"
-        }
-
-        seater_type = seater_names.get(
-            seat_count,
-            "unknown"
-        )
-
-        # ---------------------------------------------------------------
-        # Seat measurements
-        # ---------------------------------------------------------------
-
-        seat_width = None
-        seat_height = None
-        seat_ar = None
-        seat_overall_ratio = None
-        seat_inner_ratio = None
-        inner_overall_ratio = None
-
-        if main_seat is not None:
-
-            seat_width = float(
-                main_seat.width_px
-            )
-
-            seat_height = float(
-                main_seat.height_px
-            )
-
-            if seat_height > 0:
-
-                seat_ar = (
-                    seat_width /
-                    seat_height
-                )
-
-            seat_overall_ratio = (
-                seat_width /
-                overall_width
-            )
-
-            if inner_span is not None:
-
-                if inner_span > 0:
-
-                    seat_inner_ratio = (
-                        seat_width /
-                        inner_span
-                    )
-
-                inner_overall_ratio = (
-                    inner_span /
-                    overall_width
-                )
-
-        # ---------------------------------------------------------------
-        # Shape
-        # ---------------------------------------------------------------
-
-        shape, solidity, sectional = (
-            self.classify_shape(
-                geometry_instances
-            )
-        )
-
-        # ---------------------------------------------------------------
-        # Warnings
-        # ---------------------------------------------------------------
-
-        warnings = []
-
-        if len(
-            seat_cushions
-        ) == 1:
-
-            warnings.append(
-                "One continuous seat cushion detected. "
-                "Seat cushion count was not used as "
-                "the final seat count."
-            )
-
-        if (
-            physical_left is None
-            or physical_right is None
-        ):
-
-            warnings.append(
-                "Two physical arms were not reliably "
-                "detected. Arm-to-arm span is unavailable."
-            )
-
-        if not back_cushions:
-
-            warnings.append(
-                "No back cushion detected."
-            )
-
-        if not visible_legs:
-
-            warnings.append(
-                "No geometry-valid visible legs detected."
-            )
-
-        # ---------------------------------------------------------------
-        # Components
-        # ---------------------------------------------------------------
-
-        components_detected = sorted(
-            {
-                i.cls_name
-                for i in geometry_instances
-            }
-        )
-
-        # ---------------------------------------------------------------
-        # Report
-        # ---------------------------------------------------------------
-
-        report = SofaGeometryReport(
-
-            seater_type=seater_type,
-
-            seat_count_final=seat_count,
-
-            seater_confidence=seater_confidence,
-
-            chosen_source=chosen_source,
-
-            overall_width_px=overall_width,
-
-            overall_height_px=overall_height,
-
-            arm_inner_span_px=inner_span,
-
-            seat_width_px=seat_width,
-
-            seat_height_px=seat_height,
-
-            seat_aspect_ratio=seat_ar,
-
-            seat_to_overall_ratio=seat_overall_ratio,
-
-            seat_to_inner_span_ratio=seat_inner_ratio,
-
-            inner_span_to_overall_ratio=inner_overall_ratio,
-
-            seat_cushion_count=len(
-                seat_cushions
-            ),
-
-            back_cushion_count=len(
-                back_cushions
-            ),
-
-            physical_left_arm_class=(
-                physical_left.cls_name
-                if physical_left
-                else None
-            ),
-
-            physical_right_arm_class=(
-                physical_right.cls_name
-                if physical_right
-                else None
-            ),
-
-            physical_left_arm_confidence=(
-                physical_left.confidence
-                if physical_left
-                else None
-            ),
-
-            physical_right_arm_confidence=(
-                physical_right.confidence
-                if physical_right
-                else None
-            ),
-
-            visible_leg_count=len(
-                visible_legs
-            ),
-
-            shape=shape,
-
-            is_sectional=sectional,
-
-            solidity=solidity,
-
-            components_detected=components_detected,
-
-            warnings=warnings,
-
-            explanation=seater_explanation
-        )
-
-        if verbose:
-
-            print(
-                "[5/5] Analysis complete."
+                "YOLO did not return an image."
             )
 
         print(
-            f"\nFINAL SEATER TYPE: "
-            f"{report.seater_type}"
+            f"Total detections: "
+            f"{len(raw_components)}"
+        )
+
+        print(
+            f"Prediction confidence threshold: "
+            f"{self.prediction_confidence}"
+        )
+
+        print(
+            f"Geometry confidence threshold: "
+            f"{self.geometry_confidence}"
+        )
+
+        print()
+
+        print(
+            "ALL YOLO PREDICTIONS:"
+        )
+
+        for index, component in enumerate(
+            raw_components
+        ):
+
+            print(
+                f"Prediction {index}: "
+                f"{component.cls_name} | "
+                f"confidence="
+                f"{component.confidence:.3f}"
+            )
+
+        # ----------------------------------------------------
+        # Deduplicate
+        # ----------------------------------------------------
+
+        print()
+        print(
+            "[2/4] De-duplicating masks..."
+        )
+
+        components = (
+            self.deduplicate_components(
+                raw_components
+            )
+        )
+
+        # ----------------------------------------------------
+        # Geometry-valid components
+        # ----------------------------------------------------
+
+        geometry_components = (
+            self.get_geometry_components(
+                components
+            )
+        )
+
+        print(
+            f"Geometry-valid components: "
+            f"{len(geometry_components)}"
+        )
+
+        for component in (
+            geometry_components
+        ):
+
+            print(
+                f"  {component.cls_name} "
+                f"{component.confidence:.3f}"
+            )
+
+        # ----------------------------------------------------
+        # Visible legs
+        # ----------------------------------------------------
+
+        visible_legs = (
+            self.filter_visible_legs(
+                geometry_components,
+                image_height,
+            )
+        )
+
+        # Remove raw legs from geometry list
+        # and replace them with cleaned legs.
+        non_leg_components = [
+            component
+            for component
+            in geometry_components
+            if component.cls_name
+            != "legs"
+        ]
+
+        cleaned_components = (
+            non_leg_components
+            + visible_legs
+        )
+
+        # ----------------------------------------------------
+        # Overall geometry
+        # ----------------------------------------------------
+
+        (
+            overall_width,
+            overall_height,
+            overall_aspect,
+        ) = self.calculate_overall_geometry(
+            cleaned_components
+        )
+
+        # ----------------------------------------------------
+        # Seat geometry
+        # ----------------------------------------------------
+
+        seat_geometry = (
+            self.calculate_seat_geometry(
+                cleaned_components
+            )
+        )
+
+        # ----------------------------------------------------
+        # Seater classification
+        # ----------------------------------------------------
+
+        print()
+        print(
+            "[3/4] Determining seater type..."
+        )
+
+        (
+            seat_count,
+            base_confidence,
+            classification_method,
+        ) = self.classify_seater(
+            cleaned_components,
+            overall_width,
+            overall_height,
+        )
+
+        if seat_count == 1:
+            sofa_type = "1-seater"
+
+        elif seat_count == 2:
+            sofa_type = "2-seater"
+
+        elif seat_count == 3:
+            sofa_type = "3-seater"
+
+        elif seat_count == 4:
+            sofa_type = "4-seater"
+
+        else:
+            sofa_type = "unknown"
+
+        # ----------------------------------------------------
+        # Confidence
+        # ----------------------------------------------------
+
+        confidence = (
+            base_confidence
+        )
+
+        arms = self.get_arms(
+            cleaned_components
+        )
+
+        backs = [
+            component
+            for component
+            in cleaned_components
+            if component.cls_name
+            == "back_cushion"
+        ]
+
+        if len(arms) >= 2:
+
+            confidence += 0.03
+
+        if len(backs) >= 1:
+
+            confidence += 0.02
+
+        if (
+            seat_geometry["count"]
+            >= 1
+        ):
+
+            confidence += 0.03
+
+        confidence = min(
+            confidence,
+            0.99,
+        )
+
+        # ----------------------------------------------------
+        # Create report
+        # ----------------------------------------------------
+
+        report = self.create_report(
+            cleaned_components,
+            visible_legs,
+            overall_width,
+            overall_height,
+            overall_aspect,
+            seat_geometry,
+            sofa_type,
+            seat_count,
+            confidence,
+            classification_method,
+        )
+
+        # ----------------------------------------------------
+        # Save JSON
+        # ----------------------------------------------------
+
+        json_path = os.path.join(
+            OUTPUT_DIR,
+            "geometry_report.json",
+        )
+
+        with open(
+            json_path,
+            "w",
+            encoding="utf-8",
+        ) as file:
+
+            json.dump(
+                report,
+                file,
+                indent=4,
+            )
+
+        # ----------------------------------------------------
+        # Save TXT
+        # ----------------------------------------------------
+
+        text_report = (
+            self.create_text_report(
+                report,
+                cleaned_components,
+                visible_legs,
+            )
+        )
+
+        text_path = os.path.join(
+            OUTPUT_DIR,
+            "geometry_result.txt",
+        )
+
+        with open(
+            text_path,
+            "w",
+            encoding="utf-8",
+        ) as file:
+
+            file.write(
+                text_report
+            )
+
+        # ----------------------------------------------------
+        # ONE COMBINED FINAL VISUALIZATION
+        # ----------------------------------------------------
+
+        final_visualization_path = os.path.join(
+            OUTPUT_DIR,
+            "sofa_geometry_result.png",
+        )
+
+        print()
+        print(
+            "[4/4] Creating combined background-removal "
+            "and geometry result..."
+        )
+
+        self.create_final_visualization(
+            original_image=original_image,
+            all_components=components,
+            geometry_components=cleaned_components,
+            report=report,
+            output_path=final_visualization_path,
+        )
+
+        # ----------------------------------------------------
+        # Console result
+        # ----------------------------------------------------
+
+        print()
+        print("=" * 70)
+        print("FINAL RESULT")
+        print("=" * 70)
+
+        print(
+            f"SOFA TYPE: "
+            f"{sofa_type}"
         )
 
         print(
             f"CONFIDENCE: "
-            f"{report.seater_confidence * 100:.1f}%"
+            f"{confidence * 100:.1f}%"
         )
 
+        print()
         print(
-            f"Seat cushions detected: "
-            f"{report.seat_cushion_count}"
-        )
-
-        print(
-            f"Back cushions detected: "
-            f"{report.back_cushion_count}"
+            f"Seat cushions: "
+            f"{seat_geometry['count']}"
         )
 
         print(
             f"Visible legs: "
-            f"{report.visible_leg_count}"
+            f"{len(visible_legs)}"
+        )
+
+        print()
+        print(
+            "OUTPUT FILES:"
         )
 
         print(
-            f"Overall width: "
-            f"{report.overall_width_px:.1f}px"
+            f"Combined visualization:\n"
+            f"{os.path.abspath(final_visualization_path)}"
         )
-
-        if report.arm_inner_span_px is not None:
-
-            print(
-                f"Usable seating span: "
-                f"{report.arm_inner_span_px:.1f}px"
-            )
-
-        if report.seat_to_overall_ratio is not None:
-
-            print(
-                f"Seat/overall ratio: "
-                f"{report.seat_to_overall_ratio:.3f}"
-            )
-
-        # ---------------------------------------------------------------
-        # Visualization
-        # ---------------------------------------------------------------
-
-        visualization_path = (
-            self.create_visualization(
-                image_path=processed_path
-                if os.path.exists(processed_path)
-                else image_path,
-                instances=geometry_instances,
-                physical_left=physical_left,
-                physical_right=physical_right,
-                legs=visible_legs,
-                report=report
-            )
-        )
-
-        # If temporary background image no longer exists,
-        # regenerate visualization from original.
-        if not os.path.exists(
-            visualization_path
-        ):
-
-            visualization_path = (
-                self.create_visualization(
-                    image_path=image_path,
-                    instances=geometry_instances,
-                    physical_left=physical_left,
-                    physical_right=physical_right,
-                    legs=visible_legs,
-                    report=report
-                )
-            )
 
         print(
-            f"\nAnalysis time: "
-            f"{time.time() - start_total:.1f}s"
+            f"\nText report:\n"
+            f"{os.path.abspath(text_path)}"
         )
 
-        return (
-            report,
-            geometry_instances,
-            physical_left,
-            physical_right,
-            visible_legs,
-            background_output
+        print(
+            f"\nJSON report:\n"
+            f"{os.path.abspath(json_path)}"
         )
 
+        print()
+        print("=" * 70)
 
-# ============================================================================
-# SAVE TEXT REPORT
-# ============================================================================
+        return report
 
-def save_text_report(
-    report: SofaGeometryReport,
-    path: str
-) -> None:
 
-    lines = []
+# ============================================================
+# IMAGE PATH PROMPT
+# ============================================================
 
-    lines.append(
-        "SOFA GEOMETRY ANALYSIS"
-    )
-
-    lines.append(
-        "=" * 70
-    )
-
-    lines.append(
-        f"Final seater type: "
-        f"{report.seater_type}"
-    )
-
-    lines.append(
-        f"Seater confidence: "
-        f"{report.seater_confidence * 100:.1f}%"
-    )
-
-    lines.append(
-        f"Decision source: "
-        f"{report.chosen_source}"
-    )
-
-    lines.append("")
-
-    lines.append(
-        "COMPONENT COUNTS"
-    )
-
-    lines.append(
-        "-" * 70
-    )
-
-    lines.append(
-        f"Seat cushions: "
-        f"{report.seat_cushion_count}"
-    )
-
-    lines.append(
-        f"Back cushions: "
-        f"{report.back_cushion_count}"
-    )
-
-    lines.append(
-        f"Visible legs: "
-        f"{report.visible_leg_count}"
-    )
-
-    lines.append("")
-
-    lines.append(
-        "PHYSICAL ARM ASSIGNMENT"
-    )
-
-    lines.append(
-        "-" * 70
-    )
-
-    lines.append(
-        f"Physical LEFT arm YOLO class: "
-        f"{report.physical_left_arm_class}"
-    )
-
-    lines.append(
-        f"Physical RIGHT arm YOLO class: "
-        f"{report.physical_right_arm_class}"
-    )
-
-    lines.append("")
-
-    lines.append(
-        "GEOMETRY"
-    )
-
-    lines.append(
-        "-" * 70
-    )
-
-    lines.append(
-        f"Overall width: "
-        f"{report.overall_width_px:.2f}px"
-    )
-
-    lines.append(
-        f"Overall height: "
-        f"{report.overall_height_px:.2f}px"
-    )
-
-    if report.arm_inner_span_px is not None:
-
-        lines.append(
-            f"Arm inner span: "
-            f"{report.arm_inner_span_px:.2f}px"
-        )
-
-    if report.seat_width_px is not None:
-
-        lines.append(
-            f"Seat width: "
-            f"{report.seat_width_px:.2f}px"
-        )
-
-    if report.seat_height_px is not None:
-
-        lines.append(
-            f"Seat height: "
-            f"{report.seat_height_px:.2f}px"
-        )
-
-    if report.seat_aspect_ratio is not None:
-
-        lines.append(
-            f"Seat aspect ratio: "
-            f"{report.seat_aspect_ratio:.3f}"
-        )
-
-    if report.seat_to_overall_ratio is not None:
-
-        lines.append(
-            f"Seat/overall ratio: "
-            f"{report.seat_to_overall_ratio:.3f}"
-        )
-
-    if report.seat_to_inner_span_ratio is not None:
-
-        lines.append(
-            f"Seat/inner-span ratio: "
-            f"{report.seat_to_inner_span_ratio:.3f}"
-        )
-
-    if report.inner_span_to_overall_ratio is not None:
-
-        lines.append(
-            f"Inner-span/overall ratio: "
-            f"{report.inner_span_to_overall_ratio:.3f}"
-        )
-
-    lines.append("")
-
-    lines.append(
-        "SHAPE"
-    )
-
-    lines.append(
-        "-" * 70
-    )
-
-    lines.append(
-        f"Shape: "
-        f"{report.shape}"
-    )
-
-    lines.append(
-        f"Sectional: "
-        f"{report.is_sectional}"
-    )
-
-    lines.append(
-        f"Solidity: "
-        f"{report.solidity:.3f}"
-    )
-
-    lines.append("")
-
-    lines.append(
-        "SEATER REASONING"
-    )
-
-    lines.append(
-        "-" * 70
-    )
-
-    for explanation in report.explanation:
-
-        lines.append(
-            explanation
-        )
-
-    lines.append("")
-
-    lines.append(
-        "WARNINGS"
-    )
-
-    lines.append(
-        "-" * 70
-    )
-
-    if report.warnings:
-
-        for warning in report.warnings:
-
-            lines.append(
-                warning
-            )
-
-    else:
-
-        lines.append(
-            "None"
-        )
-
-    lines.append("")
-
-    lines.append(
-        "DETECTED COMPONENTS"
-    )
-
-    lines.append(
-        "-" * 70
-    )
-
-    for component in report.components_detected:
-
-        lines.append(
-            component
-        )
-
-    with open(
-        path,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        f.write(
-            "\n".join(
-                lines
-            )
-        )
-
-
-# ============================================================================
-# INTERACTIVE IMAGE PATH
-# ============================================================================
-
-def prompt_for_image_path() -> str:
+def prompt_for_image_path():
 
     while True:
 
-        path = input(
-            "\nEnter path to sofa image: "
+        print()
+
+        image_path = input(
+            "Enter path to sofa image: "
         ).strip()
 
-        path = (
-            path
+        image_path = (
+            image_path
             .strip('"')
             .strip("'")
         )
 
-        if not path:
+        if not image_path:
 
             print(
-                "Please enter a path."
+                "Please enter an image path."
             )
 
             continue
 
-        if not os.path.isfile(path):
+        if not os.path.isfile(
+            image_path
+        ):
 
             print(
-                f"File not found:\n{path}"
+                f"\nFile not found:\n"
+                f"{image_path}"
             )
 
             continue
 
-        return os.path.abspath(
-            path
-        )
+        return image_path
 
 
-# ============================================================================
+# ============================================================
 # MAIN
-# ============================================================================
+# ============================================================
 
 def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Sofa geometry and seater analysis"
+            "Sofa YOLO segmentation "
+            "and geometry analysis"
         )
     )
 
@@ -2852,47 +2114,49 @@ def main():
         default=None,
         help=(
             "Path to sofa image. "
-            "If omitted, program asks interactively."
-        )
+            "If omitted, the program "
+            "asks interactively."
+        ),
     )
 
     parser.add_argument(
         "--weights",
-        default=DEFAULT_WEIGHTS,
+        default=MODEL_PATH,
         help=(
-            "Path to trained YOLO segmentation model."
-        )
+            "Path to YOLO segmentation "
+            "weights."
+        ),
     )
 
     parser.add_argument(
         "--conf",
         type=float,
-        default=DEFAULT_CONFIDENCE,
+        default=PREDICTION_CONFIDENCE,
         help=(
-            "YOLO prediction confidence. "
-            "Default: 0.25"
-        )
+            "YOLO prediction confidence."
+        ),
     )
 
     parser.add_argument(
-        "--no-bg-removal",
-        action="store_true",
+        "--geometry-conf",
+        type=float,
+        default=GEOMETRY_CONFIDENCE,
         help=(
-            "Skip rembg background removal."
-        )
+            "Minimum confidence for "
+            "geometry analysis."
+        ),
     )
 
     args = parser.parse_args()
 
-    # -----------------------------------------------------------------------
-    # Image
-    # -----------------------------------------------------------------------
+    # --------------------------------------------------------
+    # Get image
+    # --------------------------------------------------------
 
     if args.image:
 
         image_path = (
             args.image
-            .strip()
             .strip('"')
             .strip("'")
         )
@@ -2903,235 +2167,65 @@ def main():
             prompt_for_image_path()
         )
 
-    image_path = os.path.abspath(
-        image_path
-    )
-
     if not os.path.isfile(
         image_path
     ):
 
         print(
-            f"ERROR: image does not exist:\n"
-            f"{image_path}"
+            f"\nERROR: Image not found:\n"
+            f"{image_path}",
+            file=sys.stderr,
         )
 
         sys.exit(1)
 
-    # -----------------------------------------------------------------------
-    # Model
-    # -----------------------------------------------------------------------
+    # --------------------------------------------------------
+    # Run analyzer
+    # --------------------------------------------------------
 
-    weights_path = args.weights
+    try:
 
-    if not os.path.isabs(
-        weights_path
-    ):
-
-        weights_path = os.path.abspath(
-            weights_path
+        analyzer = (
+            SofaGeometryAnalyzer(
+                model_path=args.weights,
+                prediction_confidence=args.conf,
+                geometry_confidence=(
+                    args.geometry_conf
+                ),
+            )
         )
 
-    if not os.path.isfile(
-        weights_path
-    ):
-
-        print(
-            "\nERROR: YOLO weights not found:"
+        analyzer.analyze(
+            image_path
         )
 
-        print(
-            weights_path
-        )
+    except Exception as error:
 
+        print()
         print(
-            "\nExpected:"
+            "=" * 70
         )
 
         print(
-            DEFAULT_WEIGHTS
+            "ERROR"
         )
 
-        sys.exit(1)
-
-    # -----------------------------------------------------------------------
-    # Output directory
-    # -----------------------------------------------------------------------
-
-    os.makedirs(
-        OUTPUT_DIR,
-        exist_ok=True
-    )
-
-    print(
-        "\n"
-        + "=" * 70
-    )
-
-    print(
-        "SOFA GEOMETRY ANALYSIS"
-    )
-
-    print(
-        "=" * 70
-    )
-
-    print(
-        f"\nInput image:"
-    )
-
-    print(
-        image_path
-    )
-
-    print(
-        f"\nOutput directory:"
-    )
-
-    print(
-        OUTPUT_DIR
-    )
-
-    # -----------------------------------------------------------------------
-    # Analyzer
-    # -----------------------------------------------------------------------
-
-    analyzer = SofaGeometryAnalyzer(
-        weights_path=weights_path,
-        conf=args.conf
-    )
-
-    # -----------------------------------------------------------------------
-    # Analyze
-    # -----------------------------------------------------------------------
-
-    (
-        report,
-        instances,
-        physical_left,
-        physical_right,
-        visible_legs,
-        background_output
-    ) = analyzer.analyze(
-
-        image_path=image_path,
-
-        remove_bg=(
-            not args.no_bg_removal
-        ),
-
-        verbose=True
-    )
-
-    # -----------------------------------------------------------------------
-    # Save JSON
-    # -----------------------------------------------------------------------
-
-    json_path = os.path.join(
-        OUTPUT_DIR,
-        "geometry_result.json"
-    )
-
-    with open(
-        json_path,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            report.to_dict(),
-            f,
-            indent=4,
-            ensure_ascii=False
+        print(
+            "=" * 70
         )
 
-    # -----------------------------------------------------------------------
-    # Save TXT
-    # -----------------------------------------------------------------------
+        print(
+            str(error)
+        )
 
-    txt_path = os.path.join(
-        OUTPUT_DIR,
-        "geometry_result.txt"
-    )
+        print()
 
-    save_text_report(
-        report,
-        txt_path
-    )
-
-    # -----------------------------------------------------------------------
-    # Final output
-    # -----------------------------------------------------------------------
-
-    visualization_path = os.path.join(
-        OUTPUT_DIR,
-        "geometry_result.jpg"
-    )
-
-    print(
-        "\n"
-        + "=" * 70
-    )
-
-    print(
-        "FINAL RESULT"
-    )
-
-    print(
-        "=" * 70
-    )
-
-    print(
-        f"\nSEATER TYPE: "
-        f"{report.seater_type}"
-    )
-
-    print(
-        f"CONFIDENCE: "
-        f"{report.seater_confidence * 100:.1f}%"
-    )
-
-    print(
-        f"\nJSON:"
-    )
-
-    print(
-        json_path
-    )
-
-    print(
-        f"\nTEXT REPORT:"
-    )
-
-    print(
-        txt_path
-    )
-
-    print(
-        f"\nVISUALIZATION:"
-    )
-
-    print(
-        visualization_path
-    )
-
-    print(
-        f"\nBACKGROUND REMOVED:"
-    )
-
-    print(
-        background_output
-    )
-
-    print(
-        "\n"
-        + "=" * 70
-    )
+        raise
 
 
-# ============================================================================
+# ============================================================
 # ENTRY POINT
-# ============================================================================
+# ============================================================
 
 if __name__ == "__main__":
 
