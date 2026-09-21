@@ -845,19 +845,29 @@ class SofaGeometryAnalyzer:
         )
 
         # ----------------------------------------------------
+        # Back cushion count (used as cross-check evidence
+        # throughout, not just when there is no seat cushion).
+        # Back cushions rarely fuse into one mask the way seat
+        # cushions do, so they're often the more trustworthy
+        # signal when the seat_cushion mask is ambiguous.
+        # ----------------------------------------------------
+
+        back_count = len([
+            component
+            for component in components
+            if component.cls_name
+            == "back_cushion"
+        ])
+
+        back_reliable = 1 <= back_count <= 4
+
+        # ----------------------------------------------------
         # No seat cushion
         # ----------------------------------------------------
 
         if seat_count == 0:
 
-            back_count = len([
-                component
-                for component in components
-                if component.cls_name
-                == "back_cushion"
-            ])
-
-            if 1 <= back_count <= 4:
+            if back_reliable:
 
                 return (
                     back_count,
@@ -884,10 +894,69 @@ class SofaGeometryAnalyzer:
 
             confidence = 0.90
 
+            method = "multiple seat cushions"
+
+            # Seat cushion count is direct visual evidence, so it
+            # stays primary -- but if back cushions disagree, don't
+            # silently hide that. Lower confidence and record it,
+            # so mismatches are visible instead of masked.
+            if (
+                back_reliable
+                and back_count != final_count
+            ):
+
+                confidence = 0.75
+
+                method = (
+                    f"multiple seat cushions "
+                    f"(seat_cushion={final_count}, "
+                    f"back_cushion={back_count} disagree; "
+                    f"kept seat_cushion count)"
+                )
+
             return (
                 final_count,
                 confidence,
-                "multiple seat cushions",
+                method,
+            )
+
+        # ----------------------------------------------------
+        # ONE seat_cushion instance: could be a genuine 1-seater,
+        # or multiple seats whose cushions fused into a single
+        # mask. Check back cushions FIRST, before falling back to
+        # width/aspect guessing -- back cushions are less prone to
+        # visually fusing (they usually keep a visible seam/gap).
+        # ----------------------------------------------------
+
+        if (
+            back_reliable
+            and back_count >= 2
+        ):
+
+            count = min(
+                back_count,
+                4,
+            )
+
+            # Light sanity check against overall sofa proportions,
+            # so a stray extra back-cushion detection on a narrow
+            # sofa doesn't get blown up into a 3-seater.
+            if sofa_aspect < 1.6:
+
+                count = min(count, 1)
+
+            elif sofa_aspect < 2.2:
+
+                count = min(count, 2)
+
+            confidence = 0.80
+
+            return (
+                count,
+                confidence,
+                f"back cushion count ({back_count}), "
+                f"cross-checked with sofa aspect ratio "
+                f"-- seat_cushion mask was fused/ambiguous",
             )
 
         # ----------------------------------------------------
@@ -1250,20 +1319,52 @@ class SofaGeometryAnalyzer:
                 component.mask,
             )
 
-        # Clean small holes/noise without destroying thin sofa parts.
-        kernel = np.ones((5, 5), np.uint8)
+        # Bridge real gaps between adjacent components first (e.g. the
+        # seam between an arm and the base, or between two cushions)
+        # with a larger kernel -- 5x5 was too small to close anything
+        # but the smallest segmentation noise.
+        close_kernel = np.ones((21, 21), np.uint8)
 
         foreground = cv2.morphologyEx(
             foreground,
             cv2.MORPH_CLOSE,
-            kernel,
-            iterations=1,
+            close_kernel,
+            iterations=2,
         )
+
+        # Fill the outer silhouette completely. Any pixel inside the
+        # sofa's overall outline that isn't covered by any single
+        # component mask (a seam, a low-confidence sliver, a class
+        # boundary) is still physically part of the sofa, not
+        # background -- so treat the filled outer contour as the
+        # foreground rather than the patchy union of component masks.
+        contours, _ = cv2.findContours(
+            foreground,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+
+        if contours:
+            filled = np.zeros_like(foreground)
+
+            cv2.drawContours(
+                filled,
+                contours,
+                -1,
+                255,
+                thickness=cv2.FILLED,
+            )
+
+            foreground = filled
+
+        # Light opening only, to remove tiny isolated noise specks
+        # without re-introducing holes inside the sofa silhouette.
+        open_kernel = np.ones((3, 3), np.uint8)
 
         foreground = cv2.morphologyEx(
             foreground,
             cv2.MORPH_OPEN,
-            kernel,
+            open_kernel,
             iterations=1,
         )
 
